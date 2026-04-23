@@ -1,0 +1,373 @@
+<!DOCTYPE html>
+<html lang="en" dir="ltr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DavkaWriter → Word Converter</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Crimson+Pro:ital,wght@0,300;0,400;0,600;1,400&family=DM+Mono:wght@400;500&family=Frank+Ruhl+Libre:wght@400;700&family=Noto+Serif+Hebrew:wght@400;700&family=Noto+Rashi+Hebrew:wght@400;700&family=Noto+Sans+Hebrew:wght@400;700&family=Heebo:wght@400;700&family=Suez+One&family=Gveret+Levin&display=swap" rel="stylesheet">
+<style>
+/* Stam Ashkenaz CLM + Ezra SIL via jsDelivr CDN (GPL/OFL — self-hosting permitted) */
+@font-face {
+  font-family:'Stam Ashkenaz CLM'; font-style:normal; font-weight:400; font-display:swap;
+  src:url('https://cdn.jsdelivr.net/gh/aharonium/fonts@master/Fonts/Hebrew%20Letters%20only/Culmus%20Project%20%28GPL%20and%20GPL%2BFE%29/Yoram%20Gnat%20%28GPL%2BFE%29/Sofer%20Stam/Sofer%20Stam%20Ashkenaz/StamAshkenazCLM.ttf') format('truetype');
+}
+@font-face {
+  font-family:'Ezra SIL'; font-style:normal; font-weight:400; font-display:swap;
+  src:url('https://cdn.jsdelivr.net/gh/aharonium/fonts@master/Fonts/Hebrew%20Letters%20only/SIL%20International%20%28OFL%29/Ezra%20SIL/EzraSIL-R.ttf') format('truetype');
+}
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --ink:#1a1208;--parchment:#f7f0e3;--cream:#ede5d0;
+  --amber:#b8860b;--amber-lt:#d4a017;--amber-dim:#7a5900;
+  --rust:#8b3a0a;--shadow:rgba(26,18,8,.15);--border:rgba(184,134,11,.35);--r:10px;
+  font-family:'Crimson Pro',Georgia,serif;font-size:18px;color:var(--ink);background:var(--parchment);
+}
+body{min-height:100vh;background:radial-gradient(ellipse 80% 60% at 50% -10%,rgba(184,134,11,.12) 0%,transparent 70%),var(--parchment);display:flex;flex-direction:column;align-items:center}
+header{width:100%;max-width:780px;padding:3.5rem 2rem 0;text-align:center}
+main{width:100%;max-width:780px;padding:0 2rem 4rem}
+.eyebrow{font-family:'DM Mono',monospace;font-size:.72rem;letter-spacing:.18em;text-transform:uppercase;color:var(--amber);margin-bottom:.8rem}
+h1{font-size:clamp(2rem,5vw,3.2rem);font-weight:300;line-height:1.15;color:var(--ink);margin-bottom:.5rem}
+h1 em{font-style:italic;color:var(--amber-dim)}
+.subtitle{font-size:1.05rem;color:#5a4a2a;line-height:1.6;max-width:540px;margin:.8rem auto 2.5rem}
+.heb-title{display:block;direction:rtl;font-size:clamp(1.2rem,3vw,1.7rem);color:var(--amber);font-weight:400;letter-spacing:.05em;margin-bottom:.5rem}
+.rule{display:flex;align-items:center;gap:1rem;margin:2rem 0;color:var(--border)}
+.rule::before,.rule::after{content:'';flex:1;height:1px;background:var(--border)}
+.rule-glyph{font-size:1.1rem;color:var(--amber)}
+#drop-zone{border:2px dashed var(--border);border-radius:var(--r);background:rgba(237,229,208,.55);padding:3.5rem 2rem;text-align:center;cursor:pointer;transition:border-color .2s,background .2s,transform .15s;position:relative}
+#drop-zone:hover,#drop-zone.drag-over{border-color:var(--amber);background:rgba(212,160,23,.08);transform:translateY(-2px)}
+#drop-zone.drag-over{border-style:solid}
+#file-input{display:none}
+.upload-icon{width:52px;height:52px;margin:0 auto 1.2rem;background:var(--amber);border-radius:50%;display:flex;align-items:center;justify-content:center;transition:transform .2s}
+#drop-zone:hover .upload-icon{transform:scale(1.08)}
+.upload-icon svg{width:26px;height:26px;stroke:white;fill:none;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
+.drop-label{font-size:1.15rem;font-weight:600;color:var(--ink);margin-bottom:.4rem}
+.drop-sub{font-size:.9rem;color:#7a6840;font-family:'DM Mono',monospace}
+.browse-link{color:var(--amber-dim);text-decoration:underline;cursor:pointer;font-style:italic}
+#file-info{display:none;align-items:center;gap:.8rem;background:rgba(184,134,11,.1);border:1px solid var(--border);border-radius:6px;padding:.7rem 1rem;margin-top:1.2rem;text-align:left}
+#file-info.visible{display:flex}
+.file-icon{font-size:1.4rem}
+#file-name{font-weight:600;font-size:.95rem;flex:1}
+#file-size{font-family:'DM Mono',monospace;font-size:.78rem;color:#7a6840}
+#clear-file{background:none;border:none;cursor:pointer;color:#999;font-size:1.1rem;line-height:1}
+#clear-file:hover{color:var(--rust)}
+.options{display:flex;align-items:center;gap:1rem;margin:1.4rem 0;flex-wrap:wrap}
+.toggle-wrap{display:flex;align-items:center;gap:.55rem;background:rgba(237,229,208,.7);border:1px solid var(--border);border-radius:99px;padding:.45rem .9rem;cursor:pointer;user-select:none;transition:background .15s}
+.toggle-wrap:hover{background:rgba(212,160,23,.12)}
+.toggle-wrap input{display:none}
+.toggle{width:36px;height:20px;background:#c8b88a;border-radius:99px;position:relative;transition:background .2s;flex-shrink:0}
+.toggle::after{content:'';position:absolute;width:14px;height:14px;background:white;border-radius:50%;top:3px;left:3px;transition:transform .2s;box-shadow:0 1px 3px rgba(0,0,0,.2)}
+input:checked + .toggle{background:var(--amber)}
+input:checked + .toggle::after{transform:translateX(16px)}
+.toggle-label{font-size:.92rem;color:var(--ink)}
+.hprev{font-size:1.05rem;color:var(--amber-dim);letter-spacing:.02em;direction:rtl}
+#convert-btn{width:100%;padding:1rem 2rem;background:var(--amber);color:white;border:none;border-radius:var(--r);font-family:'Crimson Pro',serif;font-size:1.15rem;font-weight:600;cursor:pointer;transition:background .2s,transform .12s,box-shadow .2s;box-shadow:0 4px 14px rgba(184,134,11,.3);display:flex;align-items:center;justify-content:center;gap:.6rem}
+#convert-btn:hover:not(:disabled){background:var(--amber-lt);transform:translateY(-1px);box-shadow:0 6px 20px rgba(184,134,11,.4)}
+#convert-btn:active:not(:disabled){transform:translateY(0)}
+#convert-btn:disabled{opacity:.55;cursor:not-allowed;transform:none}
+#progress-wrap{display:none;margin-top:1.5rem}
+#progress-wrap.visible{display:block}
+.progress-bar-bg{height:5px;background:var(--cream);border-radius:99px;overflow:hidden}
+.progress-bar-fill{height:100%;background:linear-gradient(90deg,var(--amber),var(--amber-lt));border-radius:99px;width:0%;transition:width .4s ease}
+.progress-label{font-family:'DM Mono',monospace;font-size:.78rem;color:var(--amber-dim);margin-top:.5rem;text-align:center}
+#result{display:none;margin-top:1.8rem;border-radius:var(--r);overflow:hidden;box-shadow:0 4px 20px var(--shadow)}
+#result.visible{display:block}
+#result.error .result-header{background:var(--rust)}
+.result-header{background:#2e5e1a;color:white;padding:1rem 1.4rem;display:flex;align-items:center;gap:.7rem;font-weight:600;font-size:1rem}
+.result-body{background:white;padding:1.5rem 1.4rem;border:1px solid rgba(0,0,0,.06);border-top:none;display:flex;align-items:center;gap:1rem;flex-wrap:wrap}
+#download-btn{display:inline-flex;align-items:center;gap:.5rem;background:#2e5e1a;color:white;border:none;border-radius:7px;padding:.65rem 1.3rem;font-family:'Crimson Pro',serif;font-size:1rem;font-weight:600;cursor:pointer;text-decoration:none;transition:background .15s,transform .12s}
+#download-btn:hover{background:#3d7a22;transform:translateY(-1px)}
+.convert-again{background:none;border:1px solid var(--border);border-radius:7px;padding:.65rem 1.2rem;font-family:'Crimson Pro',serif;font-size:.95rem;color:var(--amber-dim);cursor:pointer;transition:background .15s}
+.convert-again:hover{background:rgba(184,134,11,.08)}
+#error-msg{color:#7a1a0a;font-size:.95rem;padding:.8rem 0 0}
+@keyframes spin{to{transform:rotate(360deg)}}
+.spinner{width:18px;height:18px;border:2px solid rgba(255,255,255,.4);border-top-color:white;border-radius:50%;animation:spin .7s linear infinite;flex-shrink:0}
+.fonts-section{margin-top:3rem}
+.fonts-section h2{font-size:1.4rem;font-weight:400;margin-bottom:.3rem}
+.fonts-intro{font-size:.95rem;color:#5a4a2a;line-height:1.6;margin-bottom:1.4rem}
+.font-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:1rem}
+.font-card{background:white;border:1px solid var(--border);border-radius:var(--r);padding:1.1rem 1.2rem 1rem;transition:box-shadow .2s,transform .15s}
+.font-card:hover{box-shadow:0 4px 16px var(--shadow);transform:translateY(-2px)}
+.font-card-name{font-weight:600;font-size:1rem;margin-bottom:.15rem}
+.font-card-davka{font-family:'DM Mono',monospace;font-size:.7rem;color:var(--amber-dim);margin-bottom:.6rem;letter-spacing:.04em}
+.font-card-preview{direction:rtl;font-size:1.35rem;color:#2a1a00;margin-bottom:.7rem;line-height:1.7;min-height:2.4rem}
+.font-card-desc{font-size:.82rem;color:#6a5a3a;line-height:1.5;margin-bottom:.8rem}
+.font-card-link{display:inline-flex;align-items:center;gap:.3rem;font-family:'DM Mono',monospace;font-size:.72rem;color:var(--amber-dim);text-decoration:none;border-bottom:1px solid var(--border);padding-bottom:1px;transition:color .15s}
+.font-card-link:hover{color:var(--amber);border-color:var(--amber)}
+.font-card-tag{display:inline-block;font-family:'DM Mono',monospace;font-size:.65rem;background:rgba(184,134,11,.1);color:var(--amber-dim);border-radius:4px;padding:.1rem .35rem;margin-left:.4rem;vertical-align:middle}
+.howto{margin-top:2.5rem;background:rgba(237,229,208,.5);border:1px solid var(--border);border-radius:var(--r);padding:1.4rem 1.6rem}
+.howto h3{font-size:1.1rem;font-weight:600;margin-bottom:.8rem}
+.howto ol{padding-left:1.4rem}
+.howto li{font-size:.92rem;color:#4a3a1a;line-height:1.65;margin-bottom:.25rem}
+.howto code{font-family:'DM Mono',monospace;font-size:.82rem;background:rgba(184,134,11,.12);padding:.05rem .3rem;border-radius:3px;color:var(--amber-dim)}
+footer{text-align:center;font-family:'DM Mono',monospace;font-size:.72rem;color:#9a8860;letter-spacing:.06em;padding:1.5rem 2rem;border-top:1px solid var(--border);width:100%;margin-top:auto;display:flex;align-items:center;justify-content:center;gap:1.5rem;flex-wrap:wrap}
+</style>
+</head>
+<body>
+
+<header>
+  <p class="eyebrow">Legacy Format Rescue Tool</p>
+  <span class="heb-title">ממיר קבצי DavkaWriter</span>
+  <h1>DavkaWriter <em>.dwd</em> → Word</h1>
+  <p class="subtitle">Convert legacy DavkaWriter documents to modern .docx — with full Unicode Hebrew, correct vowel points (נִקּוּד), and cantillation marks (טְעָמִים).</p>
+</header>
+
+<main>
+  <div class="rule"><span class="rule-glyph">✦</span></div>
+
+  <div id="drop-zone" role="button" tabindex="0" aria-label="Upload a .dwd file">
+    <input type="file" id="file-input" accept=".dwd">
+    <div class="upload-icon">
+      <svg viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+    </div>
+    <p class="drop-label">Drop your .dwd file here</p>
+    <p class="drop-sub">or <span class="browse-link" id="browse-link">browse to select</span></p>
+    <div id="file-info">
+      <span class="file-icon">📄</span>
+      <span id="file-name">filename.dwd</span>
+      <span id="file-size">0 KB</span>
+      <button id="clear-file" title="Remove file">✕</button>
+    </div>
+  </div>
+
+  <button id="convert-btn" disabled>
+    <span id="btn-text">Convert to .docx</span>
+  </button>
+
+  <div id="progress-wrap">
+    <div class="progress-bar-bg"><div class="progress-bar-fill" id="progress-fill"></div></div>
+    <p class="progress-label" id="progress-label">Uploading…</p>
+  </div>
+
+  <div id="result">
+    <div class="result-header">
+      <span class="result-icon" id="result-icon">✓</span>
+      <span id="result-title">Conversion complete</span>
+    </div>
+    <div class="result-body">
+      <a id="download-btn" href="#" download>
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+        Download .docx
+      </a>
+      <button class="convert-again" id="convert-again">Convert another file</button>
+    </div>
+    <p id="error-msg"></p>
+  </div>
+
+  <div class="rule" style="margin-top:3rem"><span class="rule-glyph">◆</span></div>
+
+  <section class="fonts-section">
+    <h2>Recommended Hebrew Fonts</h2>
+    <p class="fonts-intro">The converted document uses <strong>David</strong> (built into Windows/Mac) as a base. Install any of these free fonts and re-apply in Word. The first two load from CDN — they will display in the preview below once loaded (may take a moment).</p>
+
+    <div class="font-grid">
+
+      <div class="font-card">
+        <div class="font-card-name">Stam Ashkenaz CLM <span class="font-card-tag">Best match</span></div>
+        <div class="font-card-davka">Replaces: Davka Stam · via jsDelivr CDN</div>
+        <div class="font-card-preview" style="font-family:'Stam Ashkenaz CLM',serif">בְּרֵאשִׁית בָּרָא</div>
+        <div class="font-card-desc">True Torah/sofer square-script (כְּתַב סְתָ"ם) — closest free match to Davka Stam. Full nikud &amp; trup. Culmus Project, GPL.</div>
+        <a class="font-card-link" href="https://www.hebrewfont.net/download.php?id=737332" target="_blank" rel="noopener">↓ hebrewfont.net</a>
+      </div>
+
+      <div class="font-card">
+        <div class="font-card-name">Ezra SIL <span class="font-card-tag">Open Font</span></div>
+        <div class="font-card-davka">Replaces: Davka Stam / David · via jsDelivr CDN</div>
+        <div class="font-card-preview" style="font-family:'Ezra SIL',serif">שְׁמַע יִשְׂרָאֵל יְהוָה</div>
+        <div class="font-card-desc">SIL's scholarly Hebrew — exceptional nikud &amp; cantillation marks, styled after the Biblia Hebraica Stuttgartensia. SIL OFL.</div>
+        <a class="font-card-link" href="https://software.sil.org/ezrasil/" target="_blank" rel="noopener">↓ software.sil.org</a>
+      </div>
+
+      <div class="font-card">
+        <div class="font-card-name">Frank Ruhl Libre</div>
+        <div class="font-card-davka">Replaces: Davka David / Drogolin</div>
+        <div class="font-card-preview" style="font-family:'Frank Ruhl Libre',serif">וְאֵלֶּה שְׁמוֹת בְּנֵי</div>
+        <div class="font-card-desc">The classic Israeli book serif. Clean, highly readable for Mishna body text. Full nikud. Culmus Project, open source.</div>
+        <a class="font-card-link" href="https://fonts.google.com/specimen/Frank+Ruhl+Libre" target="_blank" rel="noopener">↓ fonts.google.com</a>
+      </div>
+
+      <div class="font-card">
+        <div class="font-card-name">Noto Serif Hebrew <span class="font-card-tag">Google</span></div>
+        <div class="font-card-davka">Replaces: Davka David</div>
+        <div class="font-card-preview" style="font-family:'Noto Serif Hebrew',serif">לֹא תִרְצָח לֹא תִנְאָף</div>
+        <div class="font-card-desc">Google's fully open serif Hebrew. Harmonises beautifully with Latin text in mixed documents. Full nikud support.</div>
+        <a class="font-card-link" href="https://fonts.google.com/noto/specimen/Noto+Serif+Hebrew" target="_blank" rel="noopener">↓ fonts.google.com</a>
+      </div>
+
+      <div class="font-card">
+        <div class="font-card-name">Noto Rashi Hebrew</div>
+        <div class="font-card-davka">Rashi semi-cursive (פירוש רש"י)</div>
+        <div class="font-card-preview" style="font-family:'Noto Rashi Hebrew',serif">רַשִׁ"י כָּתַב פֵּרוּשׁוֹ</div>
+        <div class="font-card-desc">The traditional Rashi semi-cursive used for Talmud commentary, Tosafot, and marginal notes. Completely distinct from Stam square-script.</div>
+        <a class="font-card-link" href="https://fonts.google.com/noto/specimen/Noto+Rashi+Hebrew" target="_blank" rel="noopener">↓ fonts.google.com</a>
+      </div>
+
+      <div class="font-card">
+        <div class="font-card-name">Gveret Levin</div>
+        <div class="font-card-davka">Hebrew handwriting script</div>
+        <div class="font-card-preview" style="font-family:'Gveret Levin',cursive">כְּתָב יָד עִבְרִי יָפֶה</div>
+        <div class="font-card-desc">Elegant Hebrew handwriting by AlefAlefAlef, based on Gili Levin's natural penmanship. The most popular Hebrew handwriting font in Israel.</div>
+        <a class="font-card-link" href="https://fonts.google.com/specimen/Gveret+Levin" target="_blank" rel="noopener">↓ fonts.google.com</a>
+      </div>
+
+      <div class="font-card">
+        <div class="font-card-name">Suez One</div>
+        <div class="font-card-davka">Replaces: Davka Stam (headings)</div>
+        <div class="font-card-preview" style="font-family:'Suez One',serif">פָּרָשַׁת הַשָּׁבוּעַ</div>
+        <div class="font-card-desc">Bold, high-contrast display Hebrew from Google Fonts. Excellent for chapter headings and titles. Strong nikud support.</div>
+        <a class="font-card-link" href="https://fonts.google.com/specimen/Suez+One" target="_blank" rel="noopener">↓ fonts.google.com</a>
+      </div>
+
+      <div class="font-card">
+        <div class="font-card-name">Noto Sans Hebrew</div>
+        <div class="font-card-davka">Replaces: Davka David (sans-serif)</div>
+        <div class="font-card-preview" style="font-family:'Noto Sans Hebrew','Heebo',sans-serif">מִשְׁנָה תּוֹרָה לְמֹשֶׁה</div>
+        <div class="font-card-desc">Clean sans-serif Hebrew from Google. Best for digital reading and modern layouts. Pairs well with Calibri in mixed documents.</div>
+        <a class="font-card-link" href="https://fonts.google.com/noto/specimen/Noto+Sans+Hebrew" target="_blank" rel="noopener">↓ fonts.google.com</a>
+      </div>
+
+    </div>
+
+    <div class="howto" style="margin-top:1.5rem">
+      <h3>How to apply a font in Word after converting</h3>
+      <ol>
+        <li>Download and install the font on your computer (restart Word if already open).</li>
+        <li>Open the converted <code>.docx</code> in Word.</li>
+        <li>Press <code>Ctrl+A</code> (or <code>⌘+A</code>) to select all text.</li>
+        <li>In the Home tab → Font dropdown, choose the Hebrew font (e.g. <code>Stam Ashkenaz CLM</code>).</li>
+        <li>Hebrew text renders in the new font immediately. English runs may need to be reset separately.</li>
+        <li>For best results with nikud and trup, use <strong>Stam Ashkenaz CLM</strong> or <strong>Ezra SIL</strong>.</li>
+      </ol>
+    </div>
+  </section>
+  <!-- ── Buy me a coffee ─────────────────────────────────────── -->
+  <div style="margin-top:2.5rem;text-align:center">
+    <div class="rule"><span class="rule-glyph">✦</span></div>
+    <p style="margin:1.2rem 0 .6rem;font-size:1rem;color:#4a3000;font-family:'Crimson Pro',Georgia,serif">
+      This converter is free and open-source. If it saved you time, a coffee is always appreciated ☕
+    </p>
+    <a href="https://buymeacoffee.com/yitzyf" target="_blank" rel="noopener"
+       style="display:inline-flex;align-items:center;gap:.55rem;padding:.7rem 1.4rem;
+              background:#FFDD00;color:#000;font-weight:700;font-size:1rem;
+              border-radius:8px;text-decoration:none;border:2px solid #000;
+              font-family:'Cookie',cursive,'Crimson Pro',serif;
+              box-shadow:3px 3px 0 #b8a000;transition:transform .1s,box-shadow .1s"
+       onmouseover="this.style.transform='translateY(-2px)';this.style.boxShadow='4px 5px 0 #b8a000'"
+       onmouseout="this.style.transform='';this.style.boxShadow='3px 3px 0 #b8a000'">
+      <svg width="22" height="22" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+        <path d="M18 8h1a4 4 0 0 1 0 8h-1" stroke="#000" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+        <path d="M2 8h16v9a4 4 0 0 1-4 4H6a4 4 0 0 1-4-4V8z" stroke="#000" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+        <line x1="6" y1="1" x2="6" y2="4" stroke="#000" stroke-width="2" stroke-linecap="round"/>
+        <line x1="10" y1="1" x2="10" y2="4" stroke="#000" stroke-width="2" stroke-linecap="round"/>
+        <line x1="14" y1="1" x2="14" y2="4" stroke="#000" stroke-width="2" stroke-linecap="round"/>
+      </svg>
+      Buy me a coffee
+    </a>
+    <p style="margin-top:.7rem;font-size:.78rem;color:#7a6840;font-family:'DM Mono',monospace">
+      buymeacoffee.com/yitzyf
+    </p>
+  </div>
+
+</main>
+
+<footer>
+  <span>DWD → DOCX · open-source converter · Davka encoding reverse-engineered</span>
+  <script type="text/javascript"
+    src="https://cdnjs.buymeacoffee.com/1.0.0/button.prod.min.js"
+    data-name="bmc-button" data-slug="yitzyf" data-color="#FFDD00" data-emoji=""
+    data-font="Cookie" data-text="Buy me a coffee"
+    data-outline-color="#000000" data-font-color="#000000" data-coffee-color="#ffffff">
+  </script>
+</footer>
+
+<script>
+const dropZone=document.getElementById('drop-zone'),fileInput=document.getElementById('file-input'),
+  browseLink=document.getElementById('browse-link'),fileInfo=document.getElementById('file-info'),
+  fileName=document.getElementById('file-name'),fileSize=document.getElementById('file-size'),
+  clearFile=document.getElementById('clear-file'),convertBtn=document.getElementById('convert-btn'),
+  btnText=document.getElementById('btn-text'),progressWrap=document.getElementById('progress-wrap'),
+  progressFill=document.getElementById('progress-fill'),progressLabel=document.getElementById('progress-label'),
+  resultDiv=document.getElementById('result'),resultIcon=document.getElementById('result-icon'),
+  resultTitle=document.getElementById('result-title'),downloadBtn=document.getElementById('download-btn'),
+  convertAgain=document.getElementById('convert-again'),errorMsg=document.getElementById('error-msg'),
+
+
+let selectedFile=null;
+const fmtSize=b=>b<1024?b+' B':b<1048576?(b/1024).toFixed(1)+' KB':(b/1048576).toFixed(1)+' MB';
+
+function setFile(f){
+  if(!f)return;
+  if(!f.name.toLowerCase().endsWith('.dwd')){showError('Please upload a .dwd file.');return;}
+  selectedFile=f; fileName.textContent=f.name; fileSize.textContent=fmtSize(f.size);
+  fileInfo.classList.add('visible'); convertBtn.disabled=false; hideResult();
+}
+function clearSelection(){
+  selectedFile=null; fileInput.value=''; fileInfo.classList.remove('visible');
+  convertBtn.disabled=true; hideResult();
+}
+function hideResult(){
+  resultDiv.style.display='none'; resultDiv.classList.remove('visible','error');
+  errorMsg.textContent=''; progressWrap.classList.remove('visible'); progressFill.style.width='0%';
+}
+function showError(msg){
+  resultDiv.classList.add('visible','error'); resultDiv.style.display='block';
+  resultIcon.textContent='✕'; resultTitle.textContent='Conversion failed';
+  resultDiv.querySelector('.result-body').style.display='none'; errorMsg.textContent=msg;
+}
+function animateProgress(from,to,dur,label){
+  return new Promise(res=>{
+    progressLabel.textContent=label; const t0=performance.now();
+    (function step(now){
+      const t=Math.min((now-t0)/dur,1);
+      progressFill.style.width=(from+(to-from)*t)+'%';
+      t<1?requestAnimationFrame(step):res();
+    })(t0);
+  });
+}
+
+dropZone.addEventListener('dragover',e=>{e.preventDefault();dropZone.classList.add('drag-over')});
+dropZone.addEventListener('dragleave',()=>dropZone.classList.remove('drag-over'));
+dropZone.addEventListener('drop',e=>{e.preventDefault();dropZone.classList.remove('drag-over');const f=e.dataTransfer.files[0];if(f)setFile(f)});
+dropZone.addEventListener('click',e=>{if(e.target===clearFile||e.target.closest('#file-info'))return;fileInput.click()});
+dropZone.addEventListener('keydown',e=>{if(e.key==='Enter'||e.key===' ')fileInput.click()});
+browseLink.addEventListener('click',e=>{e.stopPropagation();fileInput.click()});
+fileInput.addEventListener('change',()=>{if(fileInput.files[0])setFile(fileInput.files[0])});
+clearFile.addEventListener('click',e=>{e.stopPropagation();clearSelection()});
+convertAgain.addEventListener('click',()=>clearSelection());
+
+convertBtn.addEventListener('click',async()=>{
+  if(!selectedFile)return;
+  convertBtn.disabled=true; btnText.innerHTML='<span class="spinner"></span> Converting…';
+  hideResult(); progressWrap.classList.add('visible');
+  try{
+    await animateProgress(0,30,400,'Uploading file…');
+    const form=new FormData();
+    form.append('file',selectedFile);
+    form.append('nikud',nikudToggle.checked?'1':'0');
+    form.append('trup',trupToggle.checked?'1':'0');
+    await animateProgress(30,55,300,'Parsing DWD structure…');
+    const resp=await fetch('/convert',{method:'POST',body:form});
+    await animateProgress(55,85,600,'Decoding Hebrew encoding…');
+    const data=await resp.json();
+    await animateProgress(85,100,300,'Building Word document…');
+    if(!resp.ok||data.error){showError(data.error||'Unknown error');return;}
+    const dlUrl=`/download/${data.job_id}?name=${encodeURIComponent(data.filename)}`;
+    downloadBtn.href=dlUrl; downloadBtn.download=data.filename;
+    resultDiv.classList.remove('error'); resultDiv.querySelector('.result-body').style.display='flex';
+    resultIcon.textContent='✓';
+    const isZip=data.filename.endsWith('.zip');
+    resultTitle.textContent=isZip?`Converted: ${data.filename} — contains images`:`Converted: ${data.filename}`;
+    downloadBtn.innerHTML=isZip
+      ? '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg> Download .zip (Word + images)'
+      : '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg> Download .docx';
+    if(isZip){errorMsg.style.color='#5a7a00';errorMsg.textContent='This DWD contained images. The ZIP includes the Word document with images embedded, plus loose high-quality copies in an images/ folder.';}
+    else{errorMsg.textContent='';}
+    resultDiv.classList.add('visible'); resultDiv.style.display='block';
+    const a=document.createElement('a'); a.href=dlUrl; a.download=data.filename; a.click();
+  }catch(e){showError('Network error: '+e.message);}
+  finally{convertBtn.disabled=false; btnText.textContent='Convert to .docx'; progressWrap.classList.remove('visible');}
+});
+</script>
+</body>
+</html>
