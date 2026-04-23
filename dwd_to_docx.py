@@ -149,6 +149,45 @@ def _detect_format(data):
 
 _BAD_XML = re.compile(r'[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]')
 
+# ── Fix 1: Windows-1252 special characters ────────────────────────────────────
+# These bytes appear in English runs and must be mapped to proper Unicode.
+_WIN1252 = {
+    0x80: '\u20AC',  # €
+    0x85: '\u2026',  # …
+    0x91: '\u2018',  # '  left single quotation mark
+    0x92: '\u2019',  # '  right single quotation mark (apostrophe)
+    0x93: '\u201C',  # "  left double quotation mark
+    0x94: '\u201D',  # "  right double quotation mark
+    0x96: '\u2013',  # –  en dash
+    0x97: '\u2014',  # —  em dash
+}
+
+# ── Fix 2: Davka formatting-marker detection ──────────────────────────────────
+# DavkaWriter stores inline style/color instructions as short literal text runs.
+# These are never real content and must be stripped from output.
+_DAVKA_MARKERS = frozenset({
+    'low', 'Low', 'low ', 'Low ', 'high', 'High', 'high ', 'High ',
+    'lowlow', 'HighHigh',
+    # Hebrew-decoded internal codes (confirmed across multiple files)
+    'לןק', 'טיחט', 'לןק ', 'טיחט ',
+    # All-caps ASCII codes
+    'TTTO',
+})
+
+def _is_marker_run(text):
+    """Return True if this decoded text is a Davka internal formatting marker."""
+    t = text.strip()
+    if not t:
+        return False
+    # Exact known markers
+    if t in _DAVKA_MARKERS:
+        return True
+    # Pattern: 'low N' or 'high N' or 'לןק Nr' or 'טיחט Nr' (music/style markers)
+    for prefix in ('low ', 'Low ', 'high ', 'High ', 'לןק ', 'טיחט '):
+        if t.startswith(prefix) and len(t) <= len(prefix) + 4:
+            return True
+    return False
+
 
 # ── Parser ────────────────────────────────────────────────────────────────────
 def _is_hebrew_content(raw):
@@ -268,7 +307,23 @@ def decode_heb(raw, with_nikud=True, with_trup=True):
         elif b in NIKUD_MAP and with_nikud and out:
             out.append(NIKUD_MAP[b])
         elif b in TRUP_MAP and with_trup and out:
+            # Fix 3: SOF PASUK (0xAB = ׃) is an end-of-verse mark that must
+            # attach to the last output character, not appear between syllables.
+            # Already handled correctly since we only append when out is non-empty.
             out.append(TRUP_MAP[b])
+    return _clean(''.join(out))
+
+def _decode_ascii(raw):
+    """Decode an English/ASCII run, mapping Windows-1252 special chars correctly."""
+    out = []
+    for b in raw:
+        if b in _WIN1252:
+            out.append(_WIN1252[b])
+        elif 0x20 <= b <= 0x7E:
+            out.append(chr(b))
+        elif b in (0x09, 0x0A, 0x0D):
+            out.append(chr(b))
+        # skip other control chars
     return _clean(''.join(out))
 
 def decode_run(ev, with_nikud=True, with_trup=True):
@@ -283,13 +338,13 @@ def decode_run(ev, with_nikud=True, with_trup=True):
     if ev.get('use_style', False):
         if sty in HEB_STYLES:
             return decode_heb(content, with_nikud, with_trup)
-        return _clean(raw.decode('ascii', errors='replace'))
+        return _decode_ascii(raw)
 
-    # Formats B & C: use pre-computed is_hebrew tag if available
+    # Formats B–E: use pre-computed is_hebrew tag if available
     is_heb = ev.get('is_hebrew', _is_hebrew_content(content))
     if is_heb:
         return decode_heb(content, with_nikud, with_trup)
-    return _clean(content.decode('ascii', errors='replace'))
+    return _decode_ascii(content)
 
 def has_page_break(ev):
     return (ev['type'] == 'run'
@@ -386,6 +441,10 @@ def build_model(events, with_nikud=True, with_trup=True):
         if sty in (SECTION_HDR_STY, HEB_HEADING_STY):
             text = text.strip()
         if not text:
+            continue
+
+        # Fix 2: drop Davka internal formatting-marker runs
+        if _is_marker_run(text):
             continue
 
         if has_page_break(ev):
