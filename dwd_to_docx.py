@@ -83,22 +83,69 @@ SECTION_HDR_STY = 0x27
 BOLD_STY        = 0x1f
 
 # ── Format detection ──────────────────────────────────────────────────────────
-# Four confirmed DavkaWriter run-signature variants:
-_FORMATS = [
-    # (run_signature, para_signature, name)
-    (bytes([0x49,0x80,0x01,0x00,0x01,0x00,0x00,0x00,0x02]),
-     bytes([0x47,0x80,0x01,0x00,0x01]),
-     'Format A (DavkaWriter original, 49-80)'),
-    (bytes([0x08,0x82,0x01,0x00,0x01,0x00,0x00,0x00,0x02]),
-     bytes([0x06,0x82,0x01,0x00,0x01]),
-     'Format B (DavkaWriter Gold, 08-82)'),
-    (bytes([0x11,0x81,0x01,0x00,0x01,0x00,0x00,0x00,0x02]),
-     bytes([0x0f,0x81,0x01,0x00,0x01]),
-     'Format C (DavkaWriter alternate, 11-81)'),
-    (bytes([0x49,0x81,0x01,0x00,0x01,0x00,0x00,0x00,0x02]),
-     bytes([0x47,0x81,0x01,0x00,0x01]),
-     'Format D (DavkaWriter poster/style, 49-81)'),
-]
+# Known DavkaWriter run-signature variants (used as a lookup for naming).
+# The parser also auto-detects unknown variants dynamically.
+_KNOWN_FORMATS = {
+    bytes([0x49,0x80,0x01,0x00,0x01,0x00,0x00,0x00,0x02]): 'Format A (DavkaWriter original, 49-80)',
+    bytes([0x08,0x82,0x01,0x00,0x01,0x00,0x00,0x00,0x02]): 'Format B (DavkaWriter Gold, 08-82)',
+    bytes([0x11,0x81,0x01,0x00,0x01,0x00,0x00,0x00,0x02]): 'Format C (DavkaWriter alternate, 11-81)',
+    bytes([0x49,0x81,0x01,0x00,0x01,0x00,0x00,0x00,0x02]): 'Format D (DavkaWriter poster/style, 49-81)',
+    bytes([0x25,0x82,0x01,0x00,0x01,0x00,0x00,0x00,0x02]): 'Format E (DavkaWriter 25-82)',
+}
+
+# The invariant suffix shared by ALL DavkaWriter run signatures.
+# Bytes [2..8] of the 9-byte header are always: 01 00 01 00 00 00 02
+_RUN_SIG_SUFFIX = bytes([0x01,0x00,0x01,0x00,0x00,0x00,0x02])
+
+def _detect_format(data):
+    """Auto-detect DWD run/para signatures from the file itself.
+
+    Every DWD run signature is 9 bytes: [b0][b1] 01 00 01 00 00 00 02
+    where b0/b1 identify the format variant. Rather than matching a fixed
+    list, we scan for any 9-byte pattern ending in the invariant suffix
+    and pick the one with the highest count — that's the run signature.
+
+    The para signature is always [b0-2][b1] 01 00 01 (5 bytes), sharing
+    b1 and using b0-2 as the first byte (observed across all known formats:
+    49→47, 08→06, 11→0f, 49→47, 25→23).
+
+    Returns (run_sig, para_sig, fmt_name, use_style_detection).
+    """
+    # Count all candidate 9-byte patterns
+    counts = {}
+    pos = 0
+    suffix = _RUN_SIG_SUFFIX
+    slen = len(suffix)
+    while True:
+        p = data.find(suffix, pos)
+        if p < 0: break
+        if p >= 2:
+            sig = data[p-2:p+slen]   # 2 prefix bytes + 7 suffix bytes = 9 total
+            if len(sig) == 9:
+                counts[sig] = counts.get(sig, 0) + 1
+        pos = p + 1
+
+    if not counts:
+        return None, None, 'Unknown (no run signatures found)', False
+
+    # Pick the most frequent signature
+    run_sig = max(counts, key=counts.__getitem__)
+
+    # Derive the para signature: b1 is shared; b0_para = b0_run - 2 (observed pattern)
+    b0_run, b1_run = run_sig[0], run_sig[1]
+    b0_para = b0_run - 2
+    para_sig = bytes([b0_para, b1_run, 0x01, 0x00, 0x01])
+
+    # Name it
+    if run_sig in _KNOWN_FORMATS:
+        fmt_name = _KNOWN_FORMATS[run_sig]
+    else:
+        fmt_name = f'Unknown variant ({b0_run:02x}-{b1_run:02x}, {counts[run_sig]} occurrences)'
+
+    # Only Format A uses style-byte language detection
+    use_style_detection = (run_sig == bytes([0x49,0x80,0x01,0x00,0x01,0x00,0x00,0x00,0x02]))
+
+    return run_sig, para_sig, fmt_name, use_style_detection
 
 _BAD_XML = re.compile(r'[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]')
 
@@ -144,15 +191,15 @@ def _build_style_map(events):
 def parse_dwd(data):
     """Parse DWD binary into (events, format_name).
 
-    Returns (events, format_name). Supported DavkaWriter format variants:
-      Format A (49-80): DavkaWriter original — style byte determines language
-      Format B (08-82): DavkaWriter Gold — content + per-file style-map detection
-      Format C (11-81): DavkaWriter alternate — same as Format B
+    Auto-detects the DavkaWriter format variant from the file itself by
+    scanning for the invariant 7-byte run-signature suffix shared by all
+    known variants. Works on both known and previously-unseen format bytes.
     """
-    sig_counts = [data.count(fmt[0]) for fmt in _FORMATS]
-    best = max(range(len(sig_counts)), key=lambda i: sig_counts[i])
-    run_sig, para_sig, fmt_name = _FORMATS[best]
-    use_style_detection = (best == 0)
+    run_sig, para_sig, fmt_name, use_style_detection = _detect_format(data)
+
+    if run_sig is None:
+        # No recognisable structure — return empty event list
+        return [], fmt_name
 
     # JPEG signatures to detect embedded images
     JPEG_SIGS = (b'\xFF\xD8\xFF\xE0', b'\xFF\xD8\xFF\xE1', b'\xFF\xD8\xFF\xDB')
