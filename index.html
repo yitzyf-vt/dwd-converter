@@ -155,7 +155,16 @@ footer{text-align:center;font-family:'DM Mono',monospace;font-size:.72rem;color:
     <p id="error-msg"></p>
   </div>
 
-  <div class="rule" style="margin-top:3rem"><span class="rule-glyph">◆</span></div>
+  <div style="margin-top:2rem;text-align:center">
+    <script type="text/javascript"
+      src="https://cdnjs.buymeacoffee.com/1.0.0/button.prod.min.js"
+      data-name="bmc-button" data-slug="yitzyf" data-color="#FFDD00" data-emoji=""
+      data-font="Cookie" data-text="Buy me a coffee"
+      data-outline-color="#000000" data-font-color="#000000" data-coffee-color="#ffffff">
+    </script>
+  </div>
+
+  <div class="rule" style="margin-top:2rem"><span class="rule-glyph">◆</span></div>
 
   <section class="fonts-section">
     <h2>Recommended Hebrew Fonts</h2>
@@ -241,13 +250,6 @@ footer{text-align:center;font-family:'DM Mono',monospace;font-size:.72rem;color:
       </ol>
     </div>
   </section>
-  <script type="text/javascript"
-    src="https://cdnjs.buymeacoffee.com/1.0.0/button.prod.min.js"
-    data-name="bmc-button" data-slug="yitzyf" data-color="#FFDD00" data-emoji=""
-    data-font="Cookie" data-text="Buy me a coffee"
-    data-outline-color="#000000" data-font-color="#000000" data-coffee-color="#ffffff">
-  </script>
-  </div>
 
 </main>
 
@@ -265,7 +267,7 @@ const dropZone=document.getElementById('drop-zone'),fileInput=document.getElemen
   progressFill=document.getElementById('progress-fill'),progressLabel=document.getElementById('progress-label'),
   resultDiv=document.getElementById('result'),resultIcon=document.getElementById('result-icon'),
   resultTitle=document.getElementById('result-title'),downloadBtn=document.getElementById('download-btn'),
-  convertAgain=document.getElementById('convert-again'),errorMsg=document.getElementById('error-msg'),
+  convertAgain=document.getElementById('convert-again'),errorMsg=document.getElementById('error-msg');
 
 
 let selectedFile=null;
@@ -319,8 +321,8 @@ convertBtn.addEventListener('click',async()=>{
     await animateProgress(0,30,400,'Uploading file…');
     const form=new FormData();
     form.append('file',selectedFile);
-    form.append('nikud',nikudToggle.checked?'1':'0');
-    form.append('trup',trupToggle.checked?'1':'0');
+    form.append('nikud','1');
+    form.append('trup','1');
     await animateProgress(30,55,300,'Parsing DWD structure…');
     const resp=await fetch('/convert',{method:'POST',body:form});
     await animateProgress(55,85,600,'Decoding Hebrew encoding…');
