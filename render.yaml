@@ -1,7 +1,6 @@
 services:
   - type: web
     name: dwd-converter
-    env: python
+    runtime: python
     buildCommand: pip install -r requirements.txt
     startCommand: gunicorn server:app
-    plan: free

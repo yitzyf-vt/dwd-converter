@@ -33,7 +33,7 @@ Trup bytes (ta'amei hamikra / cantillation marks):
     (confirmed by Sha'ar Hata'amim worksheets, 21368)
 """
 
-import io, re, sys, zipfile
+import io, re, struct, sys, zipfile
 from pathlib import Path
 from docx import Document
 from docx.shared import Pt, RGBColor, Inches
@@ -149,6 +149,94 @@ def _detect_format(data):
 
 _BAD_XML = re.compile(r'[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]')
 
+# ── Style table parser ────────────────────────────────────────────────────────
+# Maps Davka font names to their best Word-compatible equivalents.
+_FONT_SUBS = {
+    'Davka Stam':       'Ezra SIL',
+    'Davka FrankRuhl':  'Frank Ruehl CLM',
+    'Davka Hadasah':    'Noto Serif Hebrew',
+    'Davka David':      'David',
+    'Davka Rashi':      'Noto Rashi Hebrew',
+    'Davka Kastel':     'Noto Serif Hebrew',
+    'Davka Yerushalmy': 'Noto Serif Hebrew',
+    'Davka Meir':       'Noto Sans Hebrew',
+    'Davka Siddur':     'Ezra SIL',
+    'Arial':            'Arial',
+    'Times New Roman':  'Times New Roman',
+    'Calibri':          'Calibri',
+    'David':            'David',
+    'Courier New':      'Courier New',
+    'Courier':          'Courier New',
+}
+_FONT_IS_HEBREW = {k for k in _FONT_SUBS if k.startswith('Davka') or k == 'David'}
+
+_CDOC_FONT_RE = re.compile(
+    b'(Davka [\x20-\x7e]+|Arial|Times New Roman|Calibri|David|Courier New|Courier)\x00'
+)
+
+def parse_style_table(data):
+    """Parse the CDocStyle section and return a dict: style_index → props dict.
+
+    Each props dict has:
+      font      – Word-compatible font name (string)
+      size_pt   – font size in points (float), 0 if unknown
+      bold      – bool
+      italic    – bool
+      underline – bool
+      is_hebrew – bool (True for Davka Hebrew fonts)
+
+    CDocStyle record layout (24 bytes of header before null-terminated font name):
+      [0]     separator byte from previous record
+      [1]     flags_hi  — bit 7 (0x80) = bold
+      [2]     flags_lo  — bit 6 (0x40) = italic, bit 4 (0x10) = underline
+      [3-5]   ???
+      [6]     font_id (informational; we use the font name instead)
+      [7]     0x00
+      [8-10]  RGB (always 0xffffff in files seen so far — not decoded)
+      [11]    0x00
+      [12-19] reserved
+      [20-23] LE32 size in tenths-of-a-point (e.g. 1200 = 12.0pt)
+      [24+]   font name, null-terminated
+    """
+    cdoc = data.find(b'CDocStyle')
+    if cdoc < 0:
+        return {}
+
+    styles = {}
+    for m in _CDOC_FONT_RE.finditer(data, cdoc, cdoc + 200_000):
+        fpos  = m.start()
+        fname = m.group(1).decode('ascii', 'replace').rstrip()
+
+        hdr_start = fpos - 24
+        if hdr_start < cdoc:
+            continue
+        hdr = data[hdr_start:fpos]
+        if len(hdr) < 24:
+            continue
+
+        flags_hi  = hdr[1]
+        flags_lo  = hdr[2]
+        size_raw  = struct.unpack_from('<I', hdr, 20)[0]
+        size_pt   = round(size_raw / 100.0, 1) if 50 <= size_raw <= 10000 else 0
+
+        bold      = bool(flags_hi & 0x80)
+        italic    = bool(flags_lo & 0x40)
+        underline = bool(flags_lo & 0x10)
+        is_heb    = fname in _FONT_IS_HEBREW
+        word_font = _FONT_SUBS.get(fname, fname)
+
+        idx = len(styles)
+        styles[idx] = {
+            'font': word_font,
+            'size_pt': size_pt,
+            'bold': bold,
+            'italic': italic,
+            'underline': underline,
+            'is_hebrew': is_heb,
+        }
+
+    return styles
+
 # ── Fix 1: Windows-1252 special characters ────────────────────────────────────
 # These bytes appear in English runs and must be mapped to proper Unicode.
 _WIN1252 = {
@@ -191,20 +279,67 @@ def _is_marker_run(text):
 
 # ── Parser ────────────────────────────────────────────────────────────────────
 def _is_hebrew_content(raw):
-    """Content heuristic for Formats B/C.
+    """Content heuristic for runs where style classification is ambiguous.
 
-    Alef (0x60) and nikud/trup bytes are definitively Hebrew.
-    Digit or uppercase-initial with no alef/diacritics → English.
-    (Windows-1252 special chars like smart quotes don't affect detection.)
-    Everything else defaults to Hebrew.
+    Strong Hebrew signals:
+      - any nikud or trup byte → definitively Hebrew
+      - isolated alef byte (0x60) surrounded by Hebrew bytes → Hebrew
+    Strong English signals:
+      - starts with digit or uppercase letter → English
+      - high ratio of English-ASCII chars (lowercase a-z, space, punctuation)
+        with no Hebrew markers → English
+    Default: Hebrew (safer for this corpus).
     """
     if not raw: return False
+
     DIACRIT = set(NIKUD_MAP) | set(TRUP_MAP)
-    if any(b in DIACRIT for b in raw): return True   # nikud/trup → Hebrew
-    if 0x60 in raw:                    return True   # alef → Hebrew
-    # Digit or uppercase-initial with no Hebrew markers → English
+
+    # Strong Hebrew signal: nikud or trup present
+    if any(b in DIACRIT for b in raw):
+        return True
+
+    # Strong English signal: starts with digit or uppercase letter
     if 0x41 <= raw[0] <= 0x5A or 0x30 <= raw[0] <= 0x39:
         return False
+
+    # Strong English signal: high ratio of "English-only" chars
+    # English-only bytes: ASCII space (0x20), comma (0x2c), period (0x2e),
+    # paren (0x28, 0x29), digits (0x30-0x39), uppercase (0x41-0x5a),
+    # and specifically LOWERCASE letters that are NOT in Davka's Hebrew map.
+    # Davka Hebrew consonants are 0x60-0x7a. Of those:
+    #   0x60='a' = alef, 0x61='b' = bet, 0x62='c' = gimel ... 0x7a='z' = tav
+    # So lowercase 'a'-'z' ARE ambiguous (Davka uses them for Hebrew).
+    # But the KEY insight: real English text uses SPACE (0x20) frequently,
+    # while real Davka Hebrew uses space too but mixed with high-bytes.
+    # So if ALL bytes are < 0x80 AND there are multiple spaces AND common
+    # English short words appear → English.
+
+    all_low_ascii = all(b < 0x80 for b in raw)
+    if all_low_ascii:
+        # Check for common English words/patterns
+        text = bytes(raw).decode('ascii', 'replace').lower()
+        english_words = (' the ', ' and ', ' from ', ' for ', ' with ', ' that ',
+                         ' you ', ' your ', ' is ', ' was ', ' to ', ' of ',
+                         ' in ', ' it ', ' a ', ' on ', ' be ', ' will ',
+                         ' are ', ' this ', ' an ', ' by ', ' he ', ' they ',
+                         ' them ', ' her ', ' his ', ' who ', ' what ',
+                         ' which ', ' did ')
+        # Surround with spaces so word boundaries count
+        padded = ' ' + text + ' '
+        if any(w in padded for w in english_words):
+            return False
+        # Multiple words separated by spaces, starting with lowercase letter:
+        # likely English.
+        words = text.split()
+        if len(words) >= 3:
+            lowercase_starts = sum(1 for w in words if w and 'a' <= w[0] <= 'z')
+            if lowercase_starts >= len(words) * 0.8:
+                return False
+
+    # Alef byte in Hebrew context
+    if 0x60 in raw:
+        return True
+
     return True   # default Hebrew
 
 
@@ -342,9 +477,70 @@ def decode_run(ev, with_nikud=True, with_trup=True):
 
     # Formats B–E: use pre-computed is_hebrew tag if available
     is_heb = ev.get('is_hebrew', _is_hebrew_content(content))
+
+    # Per-run override: even if the style is classified Hebrew, some runs contain
+    # clean English text (English typed in a Hebrew-font style).  Detect by
+    # checking whether content would decode as readable English ASCII.
+    if is_heb and _is_clean_english(content):
+        is_heb = False
+
     if is_heb:
         return decode_heb(content, with_nikud, with_trup)
     return _decode_ascii(content)
+
+
+def _is_clean_english(raw):
+    """Conservative heuristic: does this look like clean English ASCII text?
+
+    Used to override a style's Hebrew classification when a run actually
+    contains English content.  Must be CONSERVATIVE — Davka Hebrew encoding
+    uses bytes 0x60–0x7a which ARE ASCII lowercase, so "looks like letters"
+    is not enough.  We require explicit English-word evidence.
+
+    True if ALL bytes are low-ASCII AND content contains a common English
+    short word (surrounded by word boundaries), OR starts with a character
+    class strongly associated with English (digit, uppercase, or a lowercase
+    word that is itself a common English word).
+    """
+    if not raw: return False
+    if not all(b < 0x80 for b in raw): return False
+    if b'\x60' in raw:  # alef byte — strong Hebrew indicator
+        return False
+    text = bytes(raw).decode('ascii', 'replace')
+    letter_count = sum(1 for c in text if c.isalpha())
+    if letter_count < 1: return False
+
+    # Single uppercase letter or tiny run starting with uppercase — likely English
+    # (e.g. "I", "A", "He", "My") but only if the bytes don't look like Davka Hebrew
+    stripped = text.strip()
+    if stripped in ('I', 'A', 'He', 'She', 'It', 'We', 'My', 'Me', 'Us',
+                    'My ', 'We ', 'I ', 'A '):
+        return True
+
+    lower = text.lower()
+    padded = ' ' + lower + ' '
+
+    # Require a common English word as strong evidence
+    eng_words = (' the ', ' and ', ' from ', ' for ', ' with ', ' that ',
+                 ' you ', ' your ', ' is ', ' was ', ' to ', ' of ',
+                 ' in ', ' it ', ' on ', ' be ', ' will ', ' are ',
+                 ' this ', ' an ', ' by ', ' he ', ' they ', ' them ',
+                 ' her ', ' his ', ' who ', ' what ', ' which ',
+                 ' did ', ' have ', ' has ', ' had ', ' can ', ' not ',
+                 ' but ', ' so ', ' as ', ' at ', ' one ', ' two ',
+                 ' three ', ' four ', ' five ', ' no ', ' yes ',
+                 ' my ', ' me ', ' we ', ' us ', ' or ', ' all ',
+                 ' out ', ' up ', ' go ', ' do ', ' if ',
+                 ' hehim', ' heme', ' heyou', ' himher', ' theyhim',
+                 ' themhis', ' hehis', ' ithim')
+    if any(w in padded for w in eng_words):
+        return True
+
+    # Starts with standalone digit (e.g. "1)" or "2." followed by space)
+    if len(text) >= 2 and text[0].isdigit() and text[1] in ').':
+        return True
+
+    return False
 
 def has_page_break(ev):
     return (ev['type'] == 'run'
@@ -374,11 +570,83 @@ class KeyWordBlock(Block):
 class ImageBlock(Block):
     """An embedded image extracted from the DWD file."""
     def __init__(self, raw, width, height, fmt='JPEG', index=0):
-        self.raw    = raw      # bytes
-        self.width  = width    # pixels
+        self.raw    = raw
+        self.width  = width
         self.height = height
         self.fmt    = fmt
-        self.index  = index    # sequential image number
+        self.index  = index
+
+class ParshaTopicsBlock(Block):
+    """Parsha summary chart: rows of (num, topic_heb, topic_eng, points, pesukim)."""
+    def __init__(self):
+        self.rows = []   # list of dicts
+
+class QABlock(Block):
+    """Numbered Q&A list: list of (question_runs, answer_runs) pairs."""
+    def __init__(self, inyan_title=''):
+        self.inyan_title = inyan_title
+        self.items = []  # list of {'q': [(sty,text)...], 'a': [(sty,text)...]}
+
+class PronounBlock(Block):
+    """Pronoun/verb conjugation chart."""
+    def __init__(self):
+        # Top 7-column grid headers
+        self.heb_pronouns  = []   # Hebrew pronouns (אני אתה הוא ...)
+        self.eng_pronouns  = []   # English labels (I You He ...)
+        self.prefix_forms  = []   # לשרש forms per pronoun
+        self.shoresh_forms = []   # שרש forms per pronoun
+        self.obj_suffixes  = []   # object suffixes (אתי אתך ...)
+        self.obj_labels    = []   # English object labels (Me You Him ...)
+        # Bottom conjugation lists  [(label, [(heb, eng), ...])]
+        self.sections = []   # list of (box_label, [(heb_form, eng_label), ...])
+
+class SongStanzaBlock(Block):
+    """A song stanza with a style label (Low/High) and lines."""
+    def __init__(self, style_label='', title=''):
+        self.style_label = style_label   # 'Low', 'High', etc.
+        self.title = title
+        self.lines = []  # list of (sty, text)
+
+
+def _classify_table_region(events, start, end, decode):
+    """Examine a window of events and decide if they form a known table type.
+
+    Returns (table_type, extra_info) or (None, None).
+    Table types: 'parsha_topics', 'qa', 'pronoun'.
+    """
+    styles = {ev['style'] for ev in events[start:end] if ev['type'] == 'run'}
+    texts  = [decode(ev) for ev in events[start:end] if ev['type'] == 'run']
+
+    # ── Parsha Topics signature ───────────────────────────────────────────────
+    # Has a numeric row-number column and a "topic" Hebrew column + points column
+    # Detect: row-number style (single digit), topic style, description styles
+    # Heuristic: has both a style that only ever produces short digits AND
+    # a style that produces Hebrew topic names (1-3 words)
+    digit_runs = [t for t in texts if t.strip().isdigit()]
+    if len(digit_runs) >= 3:
+        # Could be parsha topics - check for multi-run mixed Hebrew/English lines
+        mixed = [t for t in texts if t.strip() and not t.strip().isdigit()
+                 and len(t.strip()) > 5]
+        if len(mixed) >= 3:
+            return 'parsha_topics', {}
+
+    # ── Q&A signature ────────────────────────────────────────────────────────
+    # Long English questions followed by answers; triggered by '?' in question text
+    questions = [t for t in texts if '?' in t and len(t.strip()) > 10]
+    if len(questions) >= 2:
+        return 'qa', {}
+
+    # ── Pronoun chart signature ───────────────────────────────────────────────
+    # Has "אני", "אתה", "הוא" and "I", "You", "He" etc. in close proximity
+    PRONOUNS_HEB = {'אני', 'אתה', 'הוא', 'היא', 'אנחנו', 'אתם', 'הם',
+                    'אֲנִי', 'אַתָה', 'הוא', 'הִיא'}
+    PRONOUNS_ENG = {'I', 'You', 'He', 'She', 'We', 'They', 'Me', 'Him', 'Her'}
+    heb_matches = sum(1 for t in texts if t.strip() in PRONOUNS_HEB)
+    eng_matches = sum(1 for t in texts if t.strip() in PRONOUNS_ENG)
+    if heb_matches >= 3 and eng_matches >= 3:
+        return 'pronoun', {}
+
+    return None, None
 
 
 def build_model(events, with_nikud=True, with_trup=True):
@@ -390,6 +658,9 @@ def build_model(events, with_nikud=True, with_trup=True):
     kw_line_eng = []
     para_gap    = 0
     heading_count = 0
+
+    def dec(ev):
+        return decode_run(ev, with_nikud, with_trup)
 
     def flush_text():
         nonlocal cur_text
@@ -411,15 +682,372 @@ def build_model(events, with_nikud=True, with_trup=True):
         if cur_kw and cur_kw.pairs: blocks.append(cur_kw)
         cur_kw = None; in_kw_sec = False; kw_line_heb = []; kw_line_eng = []
 
-    img_index = [0]   # mutable counter for image numbering
+    img_index = [0]
 
-    for ev in events:
+    # ── Build a per-event text cache for lookahead ─────────────────────────
+    _text_cache = {}
+    def get_text(ev):
+        eid = id(ev)
+        if eid not in _text_cache:
+            if ev['type'] != 'run':
+                _text_cache[eid] = ''
+            else:
+                t = dec(ev)
+                _text_cache[eid] = '' if _is_marker_run(t) else t
+        return _text_cache[eid]
+
+    # ── Table/section detection helpers ───────────────────────────────────
+    def styles_in_window(start, length=60):
+        """Collect styles from a window of events ahead."""
+        s = set()
+        for ev in events[start:start+length]:
+            if ev['type'] == 'run':
+                s.add(ev['style'])
+        return s
+
+    def texts_in_window(start, length=60):
+        return [get_text(ev) for ev in events[start:start+length]
+                if ev['type'] == 'run' and get_text(ev).strip()]
+
+    # ── Parse a Parsha Topics block (4-col table) starting at index i ──────
+    def parse_parsha_topics(i):
+        """Parse the parsha summary chart from event index i.
+        Returns (ParshaTopicsBlock, new_i).
+        Layout per row: row_num | topic_heb | topic_eng | (description lines) | points | pesukim
+        In the event stream, each row looks like:
+          [row_num(digit)] PARA [topic_heb] PARA [description runs...] PARA [points] PARA [pesukim] PARA [next row_num...]
+        The row_num style produces single digits. Topic_heb style produces short Hebrew.
+        """
+        blk = ParshaTopicsBlock()
+        # Detect the row-number style: find first run that's a single-digit '1'
+        # (start of first row). Look ahead up to 25 events past column headers.
+        row_num_sty = None
+        for ev in events[i:i+25]:
+            if ev['type'] == 'run':
+                t = get_text(ev)
+                if t.strip() == '1':   # first row must be '1'
+                    row_num_sty = ev['style']
+                    break
+        if row_num_sty is None:
+            return None, i
+
+        cur_row = None
+        j = i
+        # Termination: stop when we see another section header (style 0x07/0x30/0xc2/0xbe)
+        # or more than 6 blank PARAₛ in a row (section boundary)
+        # Actually use a simpler stop: stop when row_num exceeds 9 (more than 9 inyanim unlikely)
+        consec_paras = 0
+        while j < len(events):
+            ev = events[j]
+            if ev['type'] == 'image':
+                break
+            if ev['type'] == 'para':
+                consec_paras += 1
+                # After 8+ consecutive paras without content, we've left the table
+                if consec_paras > 8 and cur_row and cur_row['desc']:
+                    blk.rows.append(cur_row)
+                    cur_row = None
+                    break
+                j += 1; continue
+            if ev['type'] != 'run':
+                j += 1; continue
+
+            t = get_text(ev)
+            if not t.strip():
+                j += 1; continue
+            if _is_marker_run(t):
+                j += 1; continue
+            consec_paras = 0
+
+            sty = ev['style']
+
+            # New row starts with a digit in the row_num_sty
+            if sty == row_num_sty and t.strip().isdigit():
+                if cur_row:
+                    blk.rows.append(cur_row)
+                cur_row = {'num': t.strip(), 'topic_heb': '', 'topic_eng': '',
+                           'desc': [], 'points': '', 'pesukim': ''}
+                j += 1; continue
+
+            if cur_row is None:
+                # Skip header rows (non-digit, before first row)
+                j += 1; continue
+
+            # After we have a row, classify subsequent runs
+            # Topic Hebrew: first Hebrew run after digit (style 0x65)
+            if not cur_row['topic_heb'] and ev.get('is_hebrew', _is_hebrew_content(ev['bytes'])) and not cur_row['desc']:
+                cur_row['topic_heb'] = t.strip()
+                j += 1; continue
+
+            # Points: standalone digit at the end of a row (comes after description)
+            if t.strip().isdigit() and sty != row_num_sty and cur_row['desc']:
+                if not cur_row['points']:
+                    cur_row['points'] = t.strip()
+                j += 1; continue
+
+            # Pesukim reference: contains פרק or " (comes after points)
+            if cur_row.get('points') and not cur_row['pesukim']:
+                if 'פרק' in t or ('"' in t and len(t.strip()) < 20):
+                    cur_row['pesukim'] = t.strip()
+                    j += 1; continue
+
+            # Everything else is description content
+            cur_row['desc'].append((sty, t))
+            j += 1
+
+        if cur_row and (cur_row['desc'] or cur_row['topic_heb']):
+            blk.rows.append(cur_row)
+        return blk, j
+
+    # ── Parse Q&A section starting at index i ──────────────────────────────
+    def parse_qa(i, inyan_title=''):
+        """Parse numbered Q&A section using style-based separation.
+
+        From inspection of the Lech Lecha file:
+          - Question runs use a small "question style" (e.g. 0x36 Arial 8pt)
+          - Inline Hebrew words within questions use q_style - 2 (e.g. 0x34)
+          - Answer runs use other, larger styles (0x35, 0x37, 0x3b, 0x32, 0x33)
+          - Each Q&A item ends at a PARA break
+
+        Strategy:
+          1. Detect q_style from the first run that ends with '?'
+          2. Collect runs: q_style and q_style-2 go to question; others to answer
+          3. A PARA break flushes the item
+        """
+        blk = QABlock(inyan_title)
+
+        # Detect question style: first run ending with '?' or '?\r'
+        q_style = None
+        for ev in events[i:i+100]:
+            if ev['type'] == 'run':
+                t = get_text(ev).rstrip('\r\n ')
+                if t.endswith('?'):
+                    q_style = ev['style']
+                    break
+        if q_style is None:
+            return None, i
+
+        # Inline-Hebrew-in-question style (typically q_style - 2)
+        q_inline_style = q_style - 2
+
+        j = i
+        cur_q = []
+        cur_a = []
+        seen_q_mark = False     # have we seen '?' in the current question?
+
+        # Stop markers
+        end_markers = {'Who Did It?', 'כינוי לגוף הפועל', 'כותרות הפרשה'}
+
+        def flush_item():
+            nonlocal cur_q, cur_a, seen_q_mark
+            if cur_q or cur_a:
+                blk.items.append({'q': cur_q, 'a': cur_a})
+            cur_q = []; cur_a = []; seen_q_mark = False
+
+        while j < len(events):
+            ev = events[j]
+
+            if ev['type'] == 'image':
+                flush_item()
+                break
+
+            if ev['type'] == 'para':
+                flush_item()
+                j += 1; continue
+
+            if ev['type'] != 'run':
+                j += 1; continue
+
+            t = get_text(ev)
+            if not t.strip():
+                j += 1; continue
+            if _is_marker_run(t):
+                j += 1; continue
+
+            sty = ev['style']
+
+            # End the section when we hit another major header
+            if t.strip() in end_markers:
+                flush_item()
+                return blk, j
+
+            # Classify this run
+            if sty == q_style or (sty == q_inline_style and not seen_q_mark):
+                cur_q.append((sty, t))
+                if '?' in t:
+                    seen_q_mark = True
+            else:
+                # Non-question style: goes to answer
+                cur_a.append((sty, t))
+
+            j += 1
+
+        flush_item()
+        return blk, j
+
+    # ── Parse Pronoun chart starting at index i ─────────────────────────────
+    def parse_pronoun(i):
+        """Parse the pronoun/verb conjugation chart.
+
+        Structure (verified from events + PDF):
+
+        SECTION 1 - 'Who Did It?' (Subject):
+          Top 7-column header grid:
+            Row 1: Hebrew pronouns (style 0x7c, space-separated)
+                   אֲנִי  אַתָה  הוא  הִיא  אֲנַחְנו  אַתֶם  הֵם
+            Row 2: English labels (style 0x0f, space-separated)
+                   I  You  He  She  We  You All  They
+                   (note: text appears in RTL order when displayed)
+            Rows 3+: verb prefix letters, suffix letters (style 0x7c, individual tokens)
+
+          Paired conjugation lists (style 0x0b = Heb, 0x31 = Eng):
+            Multiple 7-item groups, each group = one conjugation paradigm
+            Separated by double-PARA breaks
+
+        SECTION 2 - 'To Whom Was It Done' (Object):
+          Header: 'Mipei lbes dRrEl' (style 0xd5)
+          Similar structure with object suffixes
+
+        Termination: stop at next major section header (0xd3 with new title,
+        image, or unrelated content).
+        """
+        blk = PronounBlock()
+        j = i
+
+        # Styles in the pronoun chart family
+        PRONOUN_STYLES = {0x7c, 0x0f, 0x78, 0x0b, 0x31, 0xd3, 0xd5}
+
+        # State tracking
+        in_pairs = False          # Are we in the 0x0b/0x31 pair lists?
+        cur_list_pairs = []       # Current paradigm being collected
+        cur_list_label = ''       # Label/header for current list
+        consecutive_paras = 0
+
+        HPRON_BASE = {'אני','אתה','הוא','היא','אנחנו','אתם','הם'}
+        EPRON_BASE = {'I','You','He','She','We','They','You all','You All','Y ou'}
+
+        def _strip_nikud(s):
+            return ''.join(c for c in s if ord(c) < 0x0591 or ord(c) > 0x05C7)
+
+        def _is_pronoun_heb(t):
+            bare = _strip_nikud(t.strip())
+            return bare in HPRON_BASE
+
+        def _is_pronoun_eng(t):
+            return t.strip() in EPRON_BASE
+
+        def _finish_list():
+            nonlocal cur_list_pairs, cur_list_label
+            if cur_list_pairs:
+                blk.sections.append((cur_list_label, cur_list_pairs))
+                cur_list_pairs = []
+                cur_list_label = ''
+
+        while j < len(events):
+            ev = events[j]
+
+            if ev['type'] == 'image':
+                break
+
+            if ev['type'] == 'para':
+                consecutive_paras += 1
+                # Double-PARA breaks a paradigm list
+                if consecutive_paras >= 2 and cur_list_pairs:
+                    _finish_list()
+                j += 1; continue
+
+            if ev['type'] != 'run':
+                j += 1; continue
+
+            t = get_text(ev)
+            if not t.strip():
+                j += 1; continue
+            if _is_marker_run(t):
+                j += 1; continue
+
+            sty = ev['style']
+
+            # Stop if we've moved out of the pronoun chart area
+            if sty not in PRONOUN_STYLES:
+                # ... unless we're clearly still in a table (e.g. Bible reference)
+                if sty != 0x0b and sty != 0x31:
+                    break
+
+            consecutive_paras = 0
+            is_h = ev.get('is_hebrew', _is_hebrew_content(ev['bytes']))
+
+            # Section header — 'Who Did It?' or 'To Whom Was It Done'
+            if sty == 0xd3:
+                _finish_list()
+                cur_list_label = t.strip()
+                j += 1; continue
+
+            if sty == 0xd5:
+                _finish_list()
+                cur_list_label = t.strip()
+                j += 1; continue
+
+            # Top-grid Hebrew pronouns (space-separated in one run)
+            if sty == 0x7c and _is_pronoun_heb(t.split()[0] if t.split() else ''):
+                for tok in t.split():
+                    if tok.strip() and _is_pronoun_heb(tok):
+                        blk.heb_pronouns.append((sty, tok.strip()))
+                j += 1; continue
+
+            # Top-grid English labels (space-separated)
+            if sty == 0x0f:
+                # Could be one token or many
+                # If comma/space separated with pronoun tokens, they're labels
+                toks = [tok.strip() for tok in t.split() if tok.strip()]
+                # Detect if this is pronoun row vs object row based on content
+                has_obj = any(tok in {'Me','Him','Her','Us','Them'} for tok in toks)
+                for tok in toks:
+                    if tok in {'Me','Him','Her','Us','Them'} or (has_obj and tok == 'You'):
+                        blk.obj_labels.append((sty, tok))
+                    elif tok in EPRON_BASE:
+                        if len(blk.eng_pronouns) < 7:
+                            blk.eng_pronouns.append((sty, tok))
+                j += 1; continue
+
+            # Other 0x7c runs — verb prefix/suffix letter rows (not pronouns)
+            # Skip these individual letter tokens; they're grid cells best shown as grid
+            if sty == 0x7c:
+                # These are best rendered as additional grid rows but we can skip for now
+                j += 1; continue
+
+            # Object suffix forms (style 0x78)
+            if sty == 0x78:
+                # These pair with obj_labels; keep them
+                blk.sections.append(('object_suffixes', [(sty, t.strip(), True)]))
+                j += 1; continue
+
+            # Paired conjugation (0x0b Hebrew + 0x31 English)
+            if sty == 0x0b:
+                cur_list_pairs.append({'heb': t.strip(), 'eng': ''})
+                j += 1; continue
+
+            if sty == 0x31:
+                if cur_list_pairs and not cur_list_pairs[-1]['eng']:
+                    cur_list_pairs[-1]['eng'] = t.strip().rstrip('\r')
+                j += 1; continue
+
+            j += 1
+
+        _finish_list()
+        return blk, j
+
+    # ── Main event loop (index-based for table lookahead) ─────────────────
+    i = 0
+    while i < len(events):
+        ev = events[i]
+
         if ev['type'] == 'image':
             flush_text(); flush_kw()
             blocks.append(ImageBlock(ev['raw'], ev['width'], ev['height'],
                                      ev.get('fmt','JPEG'), img_index[0]))
             img_index[0] += 1
-            continue
+            i += 1; continue
+
         if ev['type'] == 'para':
             para_gap += 1
             if in_kw_sec:
@@ -433,18 +1061,79 @@ def build_model(events, with_nikud=True, with_trup=True):
                     para_gap = 0
                 elif cur_text and cur_text.runs:
                     flush_text()
-            continue
+            i += 1; continue
+
+        if ev['type'] != 'run':
+            i += 1; continue
 
         para_gap = 0
         sty  = ev['style']
-        text = decode_run(ev, with_nikud, with_trup)
+        text = get_text(ev)
         if sty in (SECTION_HDR_STY, HEB_HEADING_STY):
             text = text.strip()
         if not text:
+            i += 1; continue
+
+        # Markers already filtered in get_text(), but double-check
+        if _is_marker_run(text):
+            i += 1; continue
+
+        # ── Table / section detection ─────────────────────────────────────
+        # 'כותרות הפרשה' = inyan title list (English+Hebrew heading pairs)
+        # Render as a formatted header + body text
+        if text.strip() == 'כותרות הפרשה':
+            flush_text(); flush_kw()
+            # Emit the section header
+            hdr_blk = TextBlock('section_hdr'); hdr_blk.add(sty, 'Parsha Topics  /  כותרות הפרשה')
+            blocks.append(hdr_blk)
+            # Consume inyan title runs until we hit '621 Rqewim' or 'Topic'
+            j = i + 1
+            cur_body = None
+            cur_eng = ''; cur_heb = ''
+            while j < len(events):
+                ev2 = events[j]
+                if ev2['type'] == 'para': j += 1; continue
+                if ev2['type'] != 'run': j += 1; continue
+                t2 = get_text(ev2)
+                if not t2.strip() or _is_marker_run(t2): j += 1; continue
+                if '621' in t2 or t2.strip() == 'Topic': break
+                # Emit each run as a body block
+                if cur_body is None:
+                    cur_body = TextBlock('body')
+                is_h2 = ev2.get('is_hebrew', _is_hebrew_content(ev2['bytes']))
+                cur_body.add(ev2['style'], t2)
+                j += 1
+                # At Hebrew run, flush as a line
+                if is_h2 and cur_body.runs:
+                    blocks.append(cur_body)
+                    cur_body = None
+            if cur_body and cur_body.runs:
+                blocks.append(cur_body)
+            i = j  # position now at '621 Rqewim' or 'Topic'
             continue
 
-        # Fix 2: drop Davka internal formatting-marker runs
-        if _is_marker_run(text):
+        # '621 Rqewim' = start of the 7-row parsha summary chart
+        if '621' in text or '126' in text:
+            flush_text(); flush_kw()
+            blk, i = parse_parsha_topics(i + 1)
+            if blk and blk.rows:
+                blocks.append(blk)
+            continue
+
+        # Q&A section
+        if 'שאלות' in text and 'תשובות' in text:
+            flush_text(); flush_kw()
+            blk, i = parse_qa(i + 1, inyan_title=text.strip())
+            if blk and blk.items:
+                blocks.append(blk)
+            continue
+
+        # Pronoun chart (header line triggers it)
+        if 'Who Did It?' in text or 'כינוי לגוף הפועל' in text:
+            flush_text(); flush_kw()
+            blk, i = parse_pronoun(i)
+            if blk and (blk.heb_pronouns or blk.sections):
+                blocks.append(blk)
             continue
 
         if has_page_break(ev):
@@ -456,7 +1145,7 @@ def build_model(events, with_nikud=True, with_trup=True):
                               with_nikud, with_trup).strip()
             if rest:
                 cur_text = TextBlock('mishna'); cur_text.add(sty, rest)
-            continue
+            i += 1; continue
 
         if sty == SECTION_HDR_STY:
             flush_text(); flush_kw()
@@ -464,7 +1153,7 @@ def build_model(events, with_nikud=True, with_trup=True):
             blocks.append(hdr)
             if text == 'KEY WORDS':
                 in_kw_sec = True; cur_kw = KeyWordBlock()
-            continue
+            i += 1; continue
 
         if in_kw_sec:
             if sty == HEB_HEADING_STY:
@@ -474,7 +1163,7 @@ def build_model(events, with_nikud=True, with_trup=True):
                     kw_line_heb.append(text)
                 else:
                     kw_line_eng.append(text)
-                continue
+                i += 1; continue
 
         if sty == HEB_HEADING_STY:
             flush_text(); flush_kw()
@@ -483,17 +1172,18 @@ def build_model(events, with_nikud=True, with_trup=True):
             heading_count += 1
             tb = TextBlock('heading'); tb.add(sty, text)
             blocks.append(tb)
-            continue
+            i += 1; continue
 
         if sty in MISHNA_STYS:
             if not cur_text or cur_text.role != 'mishna':
                 flush_text(); cur_text = TextBlock('mishna')
             cur_text.add(sty, text)
-            continue
+            i += 1; continue
 
         if not cur_text or cur_text.role != 'body':
             flush_text(); cur_text = TextBlock('body')
         cur_text.add(sty, text)
+        i += 1
 
     flush_text(); flush_kw()
     return blocks
@@ -625,8 +1315,385 @@ FONT_NOTE = (
 NAVY  = RGBColor(0x1F, 0x4E, 0x79)
 GRAY  = RGBColor(0x50, 0x50, 0x50)
 
+# Fallback sizes when the style table has size_pt == 0
+_FALLBACK_HEB_PT  = 13
+_FALLBACK_ENG_PT  = 11
 
-def build_docx(blocks, out_path):
+_HEBREW_FONTS = frozenset([
+    'David', 'Frank Ruehl CLM', 'Noto Serif Hebrew', 'Noto Sans Hebrew',
+    'Noto Rashi Hebrew', 'Ezra SIL', 'SBL Hebrew',
+    # Also accept Davka- prefixes if they slipped through
+    'Davka Stam', 'Davka FrankRuhl', 'Davka Hadasah', 'Davka David',
+    'Davka Rashi', 'Davka Kastel', 'Davka Yerushalmy', 'Davka Meir',
+    'Davka Siddur', 'Davka Drogolin',
+])
+_ENGLISH_FONTS = frozenset([
+    'Arial', 'Times New Roman', 'Calibri', 'Courier New',
+    'Cambria', 'Georgia', 'Verdana',
+])
+
+def _validate_font_for_content(font_name, size_pt, is_hebrew):
+    """If the style table's font doesn't match the run's actual content
+    language, override to a sensible default. This handles DWD files where
+    the CDocStyle indexing doesn't match run style bytes exactly."""
+    font_is_heb = font_name in _HEBREW_FONTS
+    font_is_eng = font_name in _ENGLISH_FONTS
+    if is_hebrew and font_is_eng:
+        # Content is Hebrew but style says English font → use David at same size
+        return 'David', size_pt
+    if (not is_hebrew) and font_is_heb:
+        # Content is English but style says Hebrew font → use Arial at reasonable size
+        # If the size came from a Hebrew style, it may be way too large for English
+        # Cap at 14pt for safety since English typically shouldn't be larger
+        eng_size = min(size_pt, 14.0) if size_pt > 14 else size_pt
+        return 'Arial', eng_size
+    return font_name, size_pt
+
+
+def _styled_run(para, text, props, is_hebrew):
+    """Add a run to para, applying formatting from a parsed style props dict.
+
+    If the style's font conflicts with the content's language (e.g. content
+    is clean English but the style uses a Hebrew font), override to a sensible
+    default.  This makes the converter robust to CDocStyle indexing mismatches.
+    """
+    font_name = props.get('font', 'David' if is_hebrew else 'Calibri')
+    size_pt   = props.get('size_pt', 0) or (_FALLBACK_HEB_PT if is_hebrew else _FALLBACK_ENG_PT)
+    bold      = props.get('bold', False)
+    italic    = props.get('italic', False)
+    underline = props.get('underline', False)
+
+    # Validate that font matches content type
+    font_name, size_pt = _validate_font_for_content(font_name, size_pt, is_hebrew)
+
+    r = para.add_run(text)
+    r.font.name      = font_name
+    r.font.size      = Pt(size_pt)
+    r.font.bold      = bold      or None
+    r.font.italic    = italic    or None
+    r.font.underline = underline or None
+
+    if is_hebrew:
+        rp = r._r.get_or_add_rPr()
+        rt = OxmlElement('w:rtl'); rt.set(qn('w:val'), '1'); rp.append(rt)
+        rf = rp.find(qn('w:rFonts'))
+        if rf is None:
+            rf = OxmlElement('w:rFonts'); rp.insert(0, rf)
+        rf.set(qn('w:cs'), font_name)
+    return r
+
+
+def _render_parsha_topics(doc, blk, style_table):
+    """Render the parsha summary chart (7-row table) as a Word table.
+    4 columns: # | Hebrew Topic | Description (mixed) | Points + Ref
+    """
+    if not blk.rows:
+        return
+    NAVY = RGBColor(0x1F, 0x4E, 0x79)
+
+    # Title row
+    title_p = doc.add_paragraph()
+    _bidi(title_p, False); _spacing(title_p, before=160, after=60)
+    title_p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    _ltr_run(title_p, '126 ', sz=16, bold=True, color=NAVY)
+    _rtl_run(title_p, 'פְּסוּקִים', font='David', sz=16, bold=True, color=NAVY)
+
+    tbl = doc.add_table(rows=1, cols=4)
+    tbl.style = 'Table Grid'
+    tbl_xml = tbl._tbl
+    tblPr = tbl_xml.find(qn('w:tblPr'))
+    if tblPr is None:
+        tblPr = OxmlElement('w:tblPr'); tbl_xml.insert(0, tblPr)
+    tblW = OxmlElement('w:tblW')
+    tblW.set(qn('w:w'), '9360'); tblW.set(qn('w:type'), 'dxa')
+    tblPr.append(tblW)
+
+    # Column widths in twips: # | Topic | Description | Ref
+    col_widths = ['540', '1440', '5940', '1080']
+
+    def _set_cell_width(cell, w):
+        tc = cell._tc
+        tcPr = tc.find(qn('w:tcPr'))
+        if tcPr is None: tcPr = OxmlElement('w:tcPr'); tc.insert(0, tcPr)
+        tcW = OxmlElement('w:tcW')
+        tcW.set(qn('w:w'), w); tcW.set(qn('w:type'), 'dxa')
+        tcPr.append(tcW)
+
+    # Header row
+    hdr = tbl.rows[0]
+    headers = [('#', False), ('TOPIC / כותרות', True), ('POINTS', False), ('# פסוקים', True)]
+    for cell, (txt, is_h), w in zip(hdr.cells, headers, col_widths):
+        _set_cell_width(cell, w)
+        p = cell.paragraphs[0]
+        _bidi(p, is_h); _spacing(p, before=40, after=40)
+        p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        if is_h:
+            _rtl_run(p, txt, font='David', sz=10, bold=True, color=NAVY)
+        else:
+            _ltr_run(p, txt, sz=10, bold=True, color=NAVY)
+
+    # Data rows
+    for row_data in blk.rows:
+        row = tbl.add_row()
+        cells = row.cells
+
+        for cell, w in zip(cells, col_widths):
+            _set_cell_width(cell, w)
+
+        # Col 0: row number
+        p0 = cells[0].paragraphs[0]
+        _bidi(p0, False); _spacing(p0, before=60, after=60)
+        p0.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        _ltr_run(p0, row_data.get('num', ''), sz=16, bold=True)
+
+        # Col 1: Hebrew topic
+        p1 = cells[1].paragraphs[0]
+        _bidi(p1, True); _spacing(p1, before=40, after=40)
+        p1.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        topic = row_data.get('topic_heb', '') or row_data.get('topic_eng', '')
+        if topic:
+            is_h = _is_hebrew_content(topic.encode('utf-8', 'ignore'))
+            if is_h:
+                _rtl_run(p1, topic, font='David', sz=14, bold=True)
+            else:
+                _ltr_run(p1, topic, sz=11, bold=True)
+
+        # Col 2: Description (mixed Hebrew/English runs)
+        p2 = cells[2].paragraphs[0]
+        _bidi(p2, False); _spacing(p2, before=40, after=40)
+        for sty, txt in row_data.get('desc', []):
+            props = style_table.get(sty, {})
+            run_is_heb = props.get('is_hebrew', _is_hebrew_content(txt.encode('utf-8', 'ignore')))
+            _styled_run(p2, txt, props, run_is_heb)
+
+        # Col 3: Points count + pesukim ref
+        p3 = cells[3].paragraphs[0]
+        _bidi(p3, False); _spacing(p3, before=40, after=40)
+        p3.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        pts = row_data.get('points', '')
+        ref = row_data.get('pesukim', '')
+        if pts:
+            r = p3.add_run(pts); r.font.size = Pt(13); r.font.bold = True
+        if ref:
+            r2 = p3.add_run('\n' + ref if pts else ref)
+            r2.font.size = Pt(9)
+            r2.font.name = 'David'
+            rp = r2._r.get_or_add_rPr()
+            rt = OxmlElement('w:rtl'); rt.set(qn('w:val'), '1'); rp.append(rt)
+
+    doc.add_paragraph()
+
+
+def _render_qa(doc, blk, style_table):
+    """Render Q&A as a numbered list: question then bold answer."""
+    NAVY = RGBColor(0x1F, 0x4E, 0x79)
+    GRAY = RGBColor(0x50, 0x50, 0x50)
+
+    # Inyan section header (e.g. "שאלות ותשובות פרשת לכ לכ")
+    if blk.inyan_title:
+        p = doc.add_paragraph()
+        _spacing(p, before=180, after=60)
+        _box_border(p)
+        # Split into Hebrew and English parts
+        parts = blk.inyan_title.split()
+        for word in parts:
+            is_h = _is_hebrew_content(word.encode('utf-8', 'ignore'))
+            if is_h:
+                _bidi(p, True)
+                _rtl_run(p, word + ' ', font='David', sz=12, bold=True, color=NAVY)
+            else:
+                _ltr_run(p, word + ' ', sz=11, bold=True, color=NAVY)
+
+    for n, item in enumerate(blk.items, 1):
+        # Question paragraph
+        if item['q']:
+            p = doc.add_paragraph()
+            _bidi(p, False); _spacing(p, before=60, after=15)
+            _ltr_run(p, f'.{n}  ', sz=11)
+            for sty, txt in item['q']:
+                props = style_table.get(sty, {})
+                run_is_heb = props.get('is_hebrew', _is_hebrew_content(txt.encode('utf-8', 'ignore')))
+                _styled_run(p, txt, props, run_is_heb)
+
+        # Answer paragraph (bold, indented)
+        if item['a']:
+            p = doc.add_paragraph()
+            p.paragraph_format.left_indent = Inches(0.3)
+            _spacing(p, before=5, after=55)
+
+            heb_count = sum(1 for sty, txt in item['a']
+                           if _is_hebrew_content(txt.encode('utf-8', 'ignore'))
+                           or style_table.get(sty, {}).get('is_hebrew', False))
+            para_is_heb = heb_count > len(item['a']) / 2
+            _bidi(p, para_is_heb)
+            if para_is_heb:
+                p.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+
+            for sty, txt in item['a']:
+                props = dict(style_table.get(sty, {}))
+                props['bold'] = True  # answers are always bold
+                run_is_heb = props.get('is_hebrew', _is_hebrew_content(txt.encode('utf-8', 'ignore')))
+                _styled_run(p, txt, props, run_is_heb)
+
+    doc.add_paragraph()
+
+
+def _render_pronoun(doc, blk, style_table):
+    """Render pronoun/verb conjugation chart.
+
+    Structure:
+      - 7-col header grid (Hebrew pronouns + English labels)
+      - Multiple conjugation paradigms, each rendered as a labelled 2-col table
+        (Hebrew form | English label), 7 rows per paradigm
+    """
+    NAVY = RGBColor(0x1F, 0x4E, 0x79)
+
+    # Title
+    title_p = doc.add_paragraph()
+    _bidi(title_p, True); _spacing(title_p, before=120, after=40)
+    title_p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    _rtl_run(title_p, 'כִּינּוּי לְגוּף הַפּוֹעֵל', font='David', sz=14, bold=True, color=NAVY)
+    _ltr_run(title_p, '   Who Did It? [Subject]', sz=11, color=NAVY)
+
+    # Top 7-column subject pronoun header grid
+    if blk.heb_pronouns:
+        n = len(blk.heb_pronouns)
+        tbl = doc.add_table(rows=2, cols=n)
+        tbl.style = 'Table Grid'
+
+        for col_idx, (sty, heb) in enumerate(blk.heb_pronouns):
+            cell = tbl.rows[0].cells[col_idx]
+            p = cell.paragraphs[0]
+            _bidi(p, True); _spacing(p, before=40, after=20)
+            p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            props = style_table.get(sty, {'font': 'David', 'size_pt': 14})
+            _styled_run(p, heb, props, True)
+
+        # English labels appear in RTL order in source — reverse to align with Hebrew
+        eng_ordered = list(reversed(blk.eng_pronouns[:n])) if blk.eng_pronouns else []
+        for col_idx, (sty, eng) in enumerate(eng_ordered):
+            cell = tbl.rows[1].cells[col_idx]
+            p = cell.paragraphs[0]
+            _bidi(p, False); _spacing(p, before=10, after=20)
+            p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            props = style_table.get(sty, {'font': 'Calibri', 'size_pt': 10})
+            _styled_run(p, eng, props, False)
+
+        doc.add_paragraph()
+
+    # Render each conjugation paradigm as a separate 2-column table
+    paradigm_idx = 0
+    for label, items in blk.sections:
+        # items is now a list of dicts {'heb': str, 'eng': str}
+        # (or legacy tuple form from object_suffixes)
+        if not items:
+            continue
+
+        # Object suffixes section: render as inline list
+        if label == 'object_suffixes':
+            continue  # Skip for now — will be merged into a suffixes row later
+
+        # If this section has a label like 'Who Did It?' or 'To Whom', render it
+        if label and label not in ('',):
+            hdr_p = doc.add_paragraph()
+            _bidi(hdr_p, False); _spacing(hdr_p, before=100, after=30)
+            hdr_p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            _ltr_run(hdr_p, label, sz=12, bold=True, color=NAVY)
+
+        # Filter to dict-form pairs only
+        pairs = [it for it in items if isinstance(it, dict)]
+        if not pairs:
+            continue
+
+        paradigm_idx += 1
+        tbl2 = doc.add_table(rows=len(pairs), cols=2)
+        tbl2.style = 'Table Grid'
+
+        for row_idx, pair in enumerate(pairs):
+            heb = pair.get('heb', '')
+            eng = pair.get('eng', '')
+
+            # Hebrew cell (right)
+            p_heb = tbl2.rows[row_idx].cells[0].paragraphs[0]
+            _bidi(p_heb, True); _spacing(p_heb, before=20, after=20)
+            p_heb.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+            if heb:
+                _rtl_run(p_heb, heb, font='David', sz=14, bold=True)
+
+            # English cell (left)
+            p_eng = tbl2.rows[row_idx].cells[1].paragraphs[0]
+            _bidi(p_eng, False); _spacing(p_eng, before=20, after=20)
+            if eng:
+                _ltr_run(p_eng, eng, sz=11)
+
+    doc.add_paragraph()
+
+
+def build_docx(blocks, out_path, style_table=None):
+    """Render document blocks to a Word .docx file.
+
+    style_table: dict from parse_style_table(), maps style_index → props.
+                 When provided, each run gets the correct font, size, bold,
+                 italic, and underline from the original DavkaWriter document.
+    """
+    if style_table is None:
+        style_table = {}
+
+    def _props(sty):
+        """Return style props for a style code, with sensible defaults."""
+        return style_table.get(sty, {})
+
+    # Pre-compute which body blocks are likely titles/centered
+    # Heuristic: single-run short block with bold or large font, sandwiched by blanks
+    # OR consecutive short large-font blocks (a grid/list of titles)
+    def _looks_like_title(blk_idx):
+        """A body block that's probably a centered title."""
+        if blk_idx >= len(blocks):
+            return False
+        b = blocks[blk_idx]
+        if not (isinstance(b, TextBlock) and b.role == 'body'):
+            return False
+
+        # Get the full text and its runs
+        full_text = ''.join(t for _, t in b.runs).strip()
+        if not full_text or len(full_text) > 80:
+            return False
+        if len(b.runs) > 3:
+            return False
+
+        # Check font size — must be reasonably large (≥16pt)
+        max_size = 0
+        any_bold = False
+        for sty, _ in b.runs:
+            props = style_table.get(sty, {})
+            if props.get('size_pt', 0) > max_size:
+                max_size = props.get('size_pt', 0)
+            if props.get('bold', False):
+                any_bold = True
+        if max_size < 16 and not any_bold:
+            return False
+
+        # Structural boundary check: title if at structural boundary
+        is_boundary_start = blk_idx == 0 or (
+            isinstance(blocks[blk_idx-1], TextBlock)
+            and blocks[blk_idx-1].role in ('blank', 'page_break', 'heading', 'section_hdr')
+        )
+
+        # OR: the previous block is itself a detected title (grid-of-titles)
+        # This catches cases like a poster with many title-like rows
+        is_after_title = (
+            blk_idx > 0
+            and isinstance(blocks[blk_idx-1], TextBlock)
+            and blocks[blk_idx-1].role == 'body'
+            and max_size >= 20
+            and all(style_table.get(s, {}).get('size_pt', 0) >= 18
+                    for s, _ in blocks[blk_idx-1].runs)
+            and len(''.join(t for _, t in blocks[blk_idx-1].runs).strip()) < 80
+            and len(blocks[blk_idx-1].runs) <= 3
+        )
+
+        return is_boundary_start or is_after_title
+
     doc = Document()
     sec = doc.sections[0]
     sec.page_width = Inches(8.5); sec.page_height = Inches(11)
@@ -637,7 +1704,7 @@ def build_docx(blocks, out_path):
 
     in_ysk_body = False
 
-    for blk in blocks:
+    for blk_idx, blk in enumerate(blocks):
         if isinstance(blk, TextBlock):
             role = blk.role
 
@@ -677,12 +1744,71 @@ def build_docx(blocks, out_path):
 
             elif role == 'body':
                 p = doc.add_paragraph()
-                _bidi(p, False); _spacing(p, before=30, after=50)
+
+                # Check if this body block is likely a centered title
+                is_title = _looks_like_title(blk_idx)
+
+                # Determine paragraph directionality from majority of runs
+                heb_runs = sum(
+                    1 for sty, txt in blk.runs
+                    if is_heb(sty) or _is_hebrew_content(txt.encode('utf-8', 'ignore'))
+                    or style_table.get(sty, {}).get('is_hebrew', False)
+                )
+                para_is_heb = heb_runs > len(blk.runs) / 2
+
+                _bidi(p, para_is_heb)
+
+                if is_title:
+                    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                    _spacing(p, before=120, after=60)
+                elif para_is_heb:
+                    p.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+                    _spacing(p, before=30, after=50)
+                else:
+                    _spacing(p, before=30, after=50)
+
+                # Detect mixed-language short blocks (fill-in-the-blank pairs)
+                # and insert a tab separator between Hebrew and English sections
+                full_text = ''.join(t for _, t in blk.runs)
+                is_mixed_short = (
+                    len(full_text) < 40
+                    and len(blk.runs) >= 2
+                    and any(_is_hebrew_content(t.encode('utf-8','ignore'))
+                            for _, t in blk.runs)
+                    and any(all(c < 0x80 for c in t.encode('utf-8','ignore'))
+                            and any(c.isalpha() for c in t)
+                            for _, t in blk.runs)
+                )
+
+                prev_was_heb = None
                 for sty, text in blk.runs:
-                    if is_heb(sty) or _is_hebrew_content(text.encode('utf-8', 'ignore')):
-                        _inline_heb(p, text, sz=12)
+                    props = _props(sty)
+                    # Content trumps style metadata: if text is clearly English
+                    # (not Hebrew script), mark it as English regardless of what
+                    # the style says.  This handles DWD files where CDocStyle
+                    # indexing doesn't cleanly map to run style bytes.
+                    text_bytes = text.encode('utf-8', 'ignore')
+                    has_heb_script = any(0x0590 <= ord(c) <= 0x05ff for c in text)
+                    if has_heb_script:
+                        run_is_heb = True
+                    elif _is_clean_english(text_bytes):
+                        run_is_heb = False
                     else:
-                        _ltr_run(p, text, sz=11, bold=(sty == BOLD_STY))
+                        run_is_heb = (
+                            is_heb(sty)
+                            or props.get('is_hebrew', False)
+                            or _is_hebrew_content(text_bytes)
+                        )
+                    # Insert separator when switching from Hebrew to English in
+                    # short mixed blocks (fill-in-the-blank worksheet entries)
+                    if (is_mixed_short
+                        and prev_was_heb is True and run_is_heb is False):
+                        sep_run = p.add_run('  →  ')
+                        sep_run.font.name = 'Calibri'
+                        sep_run.font.size = Pt(9)
+                        sep_run.font.color.rgb = GRAY
+                    _styled_run(p, text, props, run_is_heb)
+                    prev_was_heb = run_is_heb
 
         elif isinstance(blk, ImageBlock):
             # Embed image inline; scale to fit 6-inch page width
@@ -708,6 +1834,18 @@ def build_docx(blocks, out_path):
         elif isinstance(blk, KeyWordBlock):
             if blk.pairs:
                 _add_kw_table(doc, blk.pairs)
+            in_ysk_body = False
+
+        elif isinstance(blk, ParshaTopicsBlock):
+            _render_parsha_topics(doc, blk, style_table)
+            in_ysk_body = False
+
+        elif isinstance(blk, QABlock):
+            _render_qa(doc, blk, style_table)
+            in_ysk_body = False
+
+        elif isinstance(blk, PronounBlock):
+            _render_pronoun(doc, blk, style_table)
             in_ysk_body = False
 
     # Font note page
@@ -777,7 +1915,8 @@ def convert(inp, out=None, with_nikud=True, with_trup=True):
     docx_path = out_path.with_suffix('.docx') if img_blocks else out_path
 
     print('Building DOCX …')
-    build_docx(blocks, str(docx_path))
+    style_table = parse_style_table(data)
+    build_docx(blocks, str(docx_path), style_table)
 
     if img_blocks:
         print(f'Packaging ZIP with {len(img_blocks)} image(s) …')
