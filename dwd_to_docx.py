@@ -174,6 +174,91 @@ _CDOC_FONT_RE = re.compile(
     b'(Davka [\x20-\x7e]+|Arial|Times New Roman|Calibri|David|Courier New|Courier)\x00'
 )
 
+def extract_header_footer_events(data, run_sig, para_sig):
+    """Extract runs/paras from CHeader and CFooter sections.
+
+    Returns a dict {'header': [events], 'footer': [events]} where events
+    are in the same format as parse_dwd returns.
+
+    Scanning stops at structural markers like CFootnoteSet or CDocRuler,
+    but skips over inline field markers like CFieldPageNo so the full
+    header/footer content is captured.
+
+    DavkaWriter stores per-page headers sequentially in a single CHeader
+    block; Word only supports one header per section.  To avoid putting
+    page-specific content into a document-wide header, we stop at the
+    first "double PARA" break, which usually separates distinct headers.
+    """
+    SKIP_MARKERS = {
+        b'CFieldPageNo', b'CFieldGraphic', b'CFieldTextBox',
+        b'CFieldTextLink', b'CFieldAutoShape', b'CFieldCurvyText',
+    }
+    END_MARKERS = {
+        b'CFootnoteSet', b'CDocRuler', b'CPageObject', b'CDocStyle',
+        b'CParagList', b'CHeader', b'CFooter', b'CTableRow',
+        b'CParagObject', b'CStyleRun',
+    }
+
+    result = {}
+    for label, marker in [('header', b'CHeader'), ('footer', b'CFooter')]:
+        pos = data.find(marker)
+        if pos < 0:
+            continue
+        start = pos + len(marker)
+        end_scan = min(start + 3000, len(data))
+        events = []
+        i = start
+        # Stop after first double PARA (for headers with per-page content)
+        max_content_runs = 5  # cap total content runs
+        consecutive_paras = 0
+        while i < end_scan - 15:
+            # MFC class marker
+            if data[i:i+4] == b'\xff\xff\x00\x00':
+                nlen = data[i+4]
+                if 0 < nlen < 30:
+                    nm = data[i+6:i+6+nlen]
+                    if (nm.startswith(b'C') and nm != marker
+                        and all(32 <= b < 127 for b in nm)):
+                        if nm in END_MARKERS:
+                            break
+                        if nm in SKIP_MARKERS:
+                            i += 6 + nlen
+                            continue
+                        break
+            # Run signature
+            if data[i:i+9] == run_sig:
+                sty, hi, ln = data[i+9], data[i+10], data[i+11]
+                if hi in (0, 1) and ln > 0 and i + 12 + ln <= len(data):
+                    events.append({
+                        'type': 'run', 'style': sty,
+                        'bytes': data[i+12:i+12+ln],
+                        'use_style': False,
+                        'hi_flag': hi,
+                    })
+                    consecutive_paras = 0
+                    # Stop if we have too many runs (likely picking up body)
+                    content_runs = sum(1 for ev in events if ev['type'] == 'run')
+                    if content_runs >= max_content_runs:
+                        break
+                    i += 12 + ln
+                    continue
+            # Para signature
+            if data[i:i+5] == para_sig:
+                events.append({'type': 'para'})
+                consecutive_paras += 1
+                # Two consecutive paras = end of first header/footer block
+                if consecutive_paras >= 2 and events and any(
+                    ev['type'] == 'run' for ev in events
+                ):
+                    break
+                i += 5
+                continue
+            i += 1
+        if events:
+            result[label] = events
+    return result
+
+
 def parse_style_table(data):
     """Parse the CDocStyle section and return a dict: style_index → props dict.
 
@@ -237,6 +322,57 @@ def parse_style_table(data):
 
     return styles
 
+
+def _normalize_style_sizes(style_table, events):
+    """Normalize font sizes based on usage frequency.
+
+    DavkaWriter sometimes records very large nominal sizes (e.g. 76pt) for
+    body text styles that render at smaller sizes in the actual document.
+    Heavily-used styles are body text and need to be capped at body sizes
+    to produce readable Word output.
+
+    Heuristic:
+      - Most-used styles (>200 runs, >2000 bytes) → BODY: 16pt Heb, 12pt Eng
+      - Medium usage (>50 runs) → MID: 22pt Heb, 18pt Eng
+      - Low usage → DISPLAY: keep up to 36pt
+    """
+    from collections import Counter
+
+    sty_runs = Counter()
+    sty_bytes = Counter()
+    for ev in events:
+        if ev.get('type') == 'run':
+            sty = ev['style']
+            sty_runs[sty] += 1
+            sty_bytes[sty] += len(ev.get('bytes', b''))
+
+    normalized = {}
+    for sty, props in style_table.items():
+        new_props = dict(props)
+        size = props.get('size_pt', 0)
+        is_heb = props.get('is_hebrew', False)
+        runs = sty_runs.get(sty, 0)
+        bytes_ = sty_bytes.get(sty, 0)
+
+        if runs > 200 and bytes_ > 2000:
+            # Body text: cap aggressively
+            cap = 16.0 if is_heb else 12.0
+            if size > cap:
+                new_props['size_pt'] = cap
+        elif runs > 50:
+            # Mid-level
+            cap = 22.0 if is_heb else 18.0
+            if size > cap:
+                new_props['size_pt'] = cap
+        else:
+            # Display/poster: cap at 36pt
+            if size > 36.0:
+                new_props['size_pt'] = 36.0
+
+        normalized[sty] = new_props
+
+    return normalized
+
 # ── Fix 1: Windows-1252 special characters ────────────────────────────────────
 # These bytes appear in English runs and must be mapped to proper Unicode.
 _WIN1252 = {
@@ -248,6 +384,15 @@ _WIN1252 = {
     0x94: '\u201D',  # "  right double quotation mark
     0x96: '\u2013',  # –  en dash
     0x97: '\u2014',  # —  em dash
+    0xA0: '\u00A0',  # non-breaking space
+    0xA9: '\u00A9',  # ©  copyright
+    0xAE: '\u00AE',  # ®  registered
+    0xB0: '\u00B0',  # °  degree
+    0xB1: '\u00B1',  # ±  plus-minus
+    0xBC: '\u00BC',  # ¼
+    0xBD: '\u00BD',  # ½
+    0xBE: '\u00BE',  # ¾
+    0x99: '\u2122',  # ™  trademark
 }
 
 # ── Fix 2: Davka formatting-marker detection ──────────────────────────────────
@@ -282,41 +427,41 @@ def _is_hebrew_content(raw):
     """Content heuristic for runs where style classification is ambiguous.
 
     Strong Hebrew signals:
-      - any nikud or trup byte → definitively Hebrew
+      - any nikud or trup byte adjacent to Hebrew consonant bytes → Hebrew
       - isolated alef byte (0x60) surrounded by Hebrew bytes → Hebrew
     Strong English signals:
-      - starts with digit or uppercase letter → English
-      - high ratio of English-ASCII chars (lowercase a-z, space, punctuation)
-        with no Hebrew markers → English
-    Default: Hebrew (safer for this corpus).
+      - starts with digit → English (lists)
+      - all-uppercase first word that forms an English word → English
+    Default: Hebrew (safer for this corpus, since Davka uses ASCII bytes
+    0x60-0x7a AND uppercase 0x40-0x5a for Hebrew letters).
     """
     if not raw: return False
 
     DIACRIT = set(NIKUD_MAP) | set(TRUP_MAP)
+    HEB_CONSONANTS = set(range(0x40, 0x5B)) | set(range(0x60, 0x7B))
 
-    # Strong Hebrew signal: nikud or trup present
-    if any(b in DIACRIT for b in raw):
-        return True
-
-    # Strong English signal: starts with digit or uppercase letter
-    if 0x41 <= raw[0] <= 0x5A or 0x30 <= raw[0] <= 0x39:
+    # Strong English signal: starts with digit
+    if 0x30 <= raw[0] <= 0x39:
         return False
 
-    # Strong English signal: high ratio of "English-only" chars
-    # English-only bytes: ASCII space (0x20), comma (0x2c), period (0x2e),
-    # paren (0x28, 0x29), digits (0x30-0x39), uppercase (0x41-0x5a),
-    # and specifically LOWERCASE letters that are NOT in Davka's Hebrew map.
-    # Davka Hebrew consonants are 0x60-0x7a. Of those:
-    #   0x60='a' = alef, 0x61='b' = bet, 0x62='c' = gimel ... 0x7a='z' = tav
-    # So lowercase 'a'-'z' ARE ambiguous (Davka uses them for Hebrew).
-    # But the KEY insight: real English text uses SPACE (0x20) frequently,
-    # while real Davka Hebrew uses space too but mixed with high-bytes.
-    # So if ALL bytes are < 0x80 AND there are multiple spaces AND common
-    # English short words appear → English.
+    # Nikud/trup adjacent to Hebrew consonant = definitively Hebrew
+    has_diacrit = any(b in DIACRIT for b in raw)
+    has_heb_consonant = any(b in HEB_CONSONANTS for b in raw)
 
+    if has_diacrit and has_heb_consonant:
+        # Both diacritic and Hebrew letter present → likely Hebrew
+        # But if ASCII text dominates with explicit English words, it's English
+        text = raw.decode('latin-1', 'replace')
+        eng_words = (' the ', ' and ', ' from ', ' for ', ' with ', ' that ',
+                     ' you ', ' is ', ' was ', ' to ', ' of ', ' by ', ' did ')
+        padded = ' ' + text.lower() + ' '
+        if any(w in padded for w in eng_words):
+            return False
+        return True
+
+    # Strong English signal: high ratio of "English-only" chars
     all_low_ascii = all(b < 0x80 for b in raw)
     if all_low_ascii:
-        # Check for common English words/patterns
         text = bytes(raw).decode('ascii', 'replace').lower()
         english_words = (' the ', ' and ', ' from ', ' for ', ' with ', ' that ',
                          ' you ', ' your ', ' is ', ' was ', ' to ', ' of ',
@@ -324,17 +469,12 @@ def _is_hebrew_content(raw):
                          ' are ', ' this ', ' an ', ' by ', ' he ', ' they ',
                          ' them ', ' her ', ' his ', ' who ', ' what ',
                          ' which ', ' did ')
-        # Surround with spaces so word boundaries count
         padded = ' ' + text + ' '
         if any(w in padded for w in english_words):
             return False
-        # Multiple words separated by spaces, starting with lowercase letter:
-        # likely English.
-        words = text.split()
-        if len(words) >= 3:
-            lowercase_starts = sum(1 for w in words if w and 'a' <= w[0] <= 'z')
-            if lowercase_starts >= len(words) * 0.8:
-                return False
+        # Note: we deliberately do NOT use a "lowercase-start ratio" rule here —
+        # Davka Hebrew encoding uses bytes 0x60–0x7a which ARE ASCII lowercase,
+        # so looks-like-lowercase-words is not sufficient evidence of English.
 
     # Alef byte in Hebrew context
     if 0x60 in raw:
@@ -396,13 +536,19 @@ def parse_dwd(data):
                 except Exception:
                     pass
         # ── Run detection ─────────────────────────────────────────────────────
+        # Run signature layout (9 bytes) + [sty:1][hi:1][ln:1][content:ln bytes]
+        # hi == 0: "normal" run (body text)
+        # hi == 1: "styled" run, often Hebrew content with its own style index
+        # (Format E files use both hi=0 and hi=1 extensively; hi=1 runs were
+        # ignored in earlier versions and caused significant content loss.)
         if data[i:i+9] == run_sig:
             sty, hi, ln = data[i+9], data[i+10], data[i+11]
-            if hi == 0 and ln > 0 and i+12+ln <= n:
+            if hi in (0, 1) and ln > 0 and i+12+ln <= n:
                 events.append({
                     'type': 'run', 'style': sty,
                     'bytes': data[i+12:i+12+ln],
                     'use_style': use_style_detection,
+                    'hi_flag': hi,
                 })
                 i += 12 + ln; continue
         if data[i:i+5] == para_sig:
@@ -439,13 +585,20 @@ def decode_heb(raw, with_nikud=True, with_trup=True):
             out.append(' ')
         elif b < 0x80 and chr(b) in ',.;:!?\'"()-/0123456789\'':
             out.append(chr(b))
-        elif b in NIKUD_MAP and with_nikud and out:
-            out.append(NIKUD_MAP[b])
-        elif b in TRUP_MAP and with_trup and out:
-            # Fix 3: SOF PASUK (0xAB = ׃) is an end-of-verse mark that must
-            # attach to the last output character, not appear between syllables.
-            # Already handled correctly since we only append when out is non-empty.
-            out.append(TRUP_MAP[b])
+        elif b in NIKUD_MAP and with_nikud:
+            # Attach to previous letter if any; otherwise output on a base char
+            # so trup posters can show standalone marks visibly.
+            if out and out[-1] != ' ':
+                out.append(NIKUD_MAP[b])
+            else:
+                # Use combining-char dotted circle base (Unicode 0x25CC) to make
+                # standalone marks visible in Word
+                out.append('\u25CC' + NIKUD_MAP[b])
+        elif b in TRUP_MAP and with_trup:
+            if out and out[-1] != ' ':
+                out.append(TRUP_MAP[b])
+            else:
+                out.append('\u25CC' + TRUP_MAP[b])
     return _clean(''.join(out))
 
 def _decode_ascii(raw):
@@ -470,19 +623,38 @@ def decode_run(ev, with_nikud=True, with_trup=True):
             start = 2
     content = raw[start:]
 
+    # Strong Hebrew signal: presence of Davka NIKUD or TRUP bytes (0x9f-0xce range).
+    # If found, this is definitely Davka Hebrew regardless of what the style says.
+    has_davka_diacritic = any(b in NIKUD_MAP or b in TRUP_MAP for b in content)
+
     if ev.get('use_style', False):
-        if sty in HEB_STYLES:
+        if sty in HEB_STYLES or has_davka_diacritic:
             return decode_heb(content, with_nikud, with_trup)
         return _decode_ascii(raw)
 
     # Formats B–E: use pre-computed is_hebrew tag if available
     is_heb = ev.get('is_hebrew', _is_hebrew_content(content))
 
+    # Strong override: Davka diacritic bytes always mean Hebrew
+    if has_davka_diacritic:
+        is_heb = True
+
     # Per-run override: even if the style is classified Hebrew, some runs contain
     # clean English text (English typed in a Hebrew-font style).  Detect by
     # checking whether content would decode as readable English ASCII.
-    if is_heb and _is_clean_english(content):
+    if is_heb and not has_davka_diacritic and _is_clean_english(content):
         is_heb = False
+
+    # Short ASCII content (1-3 chars) consisting only of Davka-uppercase
+    # letter codes (R='פּ', W='שׁ', S='שׁ', K='ך', E='ו', m='ם') is Hebrew with
+    # dagesh, NOT English.  Override even if is_hebrew=False was set.
+    if not is_heb and 1 <= len(content) <= 3:
+        # Davka uppercase Hebrew letters
+        DAVKA_UPPER = set(b'RWSKEm')
+        # Allowed extra chars: space and possibly ASCII letter for compound
+        if all(b in DAVKA_UPPER or b == 0x20 for b in content):
+            # All bytes are Davka uppercase or space → treat as Hebrew
+            is_heb = True
 
     if is_heb:
         return decode_heb(content, with_nikud, with_trup)
@@ -496,13 +668,58 @@ def _is_clean_english(raw):
     contains English content.  Must be CONSERVATIVE — Davka Hebrew encoding
     uses bytes 0x60–0x7a which ARE ASCII lowercase, so "looks like letters"
     is not enough.  We require explicit English-word evidence.
-
-    True if ALL bytes are low-ASCII AND content contains a common English
-    short word (surrounded by word boundaries), OR starts with a character
-    class strongly associated with English (digit, uppercase, or a lowercase
-    word that is itself a common English word).
     """
     if not raw: return False
+
+    # English with leading Win1252 special char (©, ®, °, ™, etc.)
+    SPECIAL_AT_START = {0xa9, 0xae, 0xb0, 0x99, 0xa2, 0xa3, 0xa5}
+    if raw[0] in SPECIAL_AT_START and len(raw) >= 4:
+        rest = raw[1:]
+        ascii_count = sum(1 for b in rest if 0x20 <= b < 0x80)
+        if ascii_count > len(rest) * 0.7:
+            return True
+
+    # If the bytes look like UTF-8 encoded English (with smart quotes etc.),
+    # decode as UTF-8 and check if remaining content is ASCII-dominant English.
+    # Common English Unicode punct: smart quotes, em/en-dash, ellipsis, ©, ®, °, ™
+    ENGLISH_UNICODE = (
+        '\u2018\u2019\u201c\u201d'  # smart quotes
+        '\u2013\u2014'              # em/en dashes
+        '\u2026'                    # ellipsis
+        '\u00a0'                    # non-breaking space
+        '\u00a9\u00ae\u00b0\u2122'  # ©, ®, °, ™
+        '\u00a2\u00a3\u00a5'        # ¢, £, ¥
+        '\u00bc\u00bd\u00be'        # ¼, ½, ¾
+    )
+    # Try UTF-8 first, then Win1252 (DavkaWriter uses Win1252 high bytes for
+    # smart quotes and other typography in English text).
+    decoded_text = None
+    for encoding in ('utf-8', 'windows-1252'):
+        try:
+            t = raw.decode(encoding)
+            if encoding == 'windows-1252':
+                # Win1252 decodes everything; only accept if NO Hebrew-range
+                # high bytes are present (those are real Davka Hebrew encoding)
+                # AND content has typical English punctuation Unicode points
+                has_eng_punct = any(c in ENGLISH_UNICODE for c in t)
+                if not has_eng_punct:
+                    continue
+            decoded_text = t
+            break
+        except UnicodeDecodeError:
+            continue
+
+    if decoded_text and all(c < '\u0080' or c in ENGLISH_UNICODE for c in decoded_text):
+        # All chars are ASCII or English-only Unicode → treat as ASCII
+        stripped = ''.join(c if c < '\u0080' else "'" for c in decoded_text)
+        raw = stripped.encode('ascii', 'ignore')
+        # Check leading-special after Unicode normalization
+        if decoded_text and decoded_text[0] in '\u00a9\u00ae\u00b0\u2122' and len(decoded_text) >= 3:
+            rest_chars = decoded_text[1:]
+            ascii_count = sum(1 for c in rest_chars if c < '\u0080')
+            if ascii_count > len(rest_chars) * 0.7:
+                return True
+
     if not all(b < 0x80 for b in raw): return False
     if b'\x60' in raw:  # alef byte — strong Hebrew indicator
         return False
@@ -510,8 +727,15 @@ def _is_clean_english(raw):
     letter_count = sum(1 for c in text if c.isalpha())
     if letter_count < 1: return False
 
+    # Words with internal apostrophe (e.g. "Par'oh", "C'na'an", "we'll", "doesn't")
+    # are almost certainly English/transliteration
+    if "'" in text and any(c.isalpha() for c in text):
+        # Check that apostrophe is between letters
+        for i in range(1, len(text) - 1):
+            if text[i] == "'" and text[i-1].isalpha() and text[i+1].isalpha():
+                return True
+
     # Single uppercase letter or tiny run starting with uppercase — likely English
-    # (e.g. "I", "A", "He", "My") but only if the bytes don't look like Davka Hebrew
     stripped = text.strip()
     if stripped in ('I', 'A', 'He', 'She', 'It', 'We', 'My', 'Me', 'Us',
                     'My ', 'We ', 'I ', 'A '):
@@ -520,7 +744,6 @@ def _is_clean_english(raw):
     lower = text.lower()
     padded = ' ' + lower + ' '
 
-    # Require a common English word as strong evidence
     eng_words = (' the ', ' and ', ' from ', ' for ', ' with ', ' that ',
                  ' you ', ' your ', ' is ', ' was ', ' to ', ' of ',
                  ' in ', ' it ', ' on ', ' be ', ' will ', ' are ',
@@ -532,13 +755,102 @@ def _is_clean_english(raw):
                  ' my ', ' me ', ' we ', ' us ', ' or ', ' all ',
                  ' out ', ' up ', ' go ', ' do ', ' if ',
                  ' hehim', ' heme', ' heyou', ' himher', ' theyhim',
-                 ' themhis', ' hehis', ' ithim')
+                 ' themhis', ' hehis', ' ithim',
+                 ' sokol ', ' inc ', ' ltd ', ' corp ', ' davka ', ' co ')
     if any(w in padded for w in eng_words):
         return True
 
-    # Starts with standalone digit (e.g. "1)" or "2." followed by space)
     if len(text) >= 2 and text[0].isdigit() and text[1] in ').':
         return True
+
+    # Title Case English
+    clean_text = text.rstrip('\x00\x01\x02\x03\x04\x05')
+    clean_text = clean_text.lstrip('\x00\x01\x02\x03\x04\x05')
+    words = clean_text.split()
+    if len(words) >= 2:
+        cap_words = sum(1 for w in words if w and 'A' <= w[0] <= 'Z')
+        if cap_words >= 2 and cap_words >= len(words) * 0.5:
+            valid = True
+            for w in words:
+                if w and 'A' <= w[0] <= 'Z':
+                    rest = w[1:]
+                    if rest and not all(
+                        ('a' <= c <= 'z') or c in '.,;:-\'"!?()' for c in rest
+                    ):
+                        valid = False
+                        break
+            if valid:
+                return True
+
+    # Single English word(s)
+    clean2 = text.rstrip('\x00\x01\x02\x03\x04\x05')
+    clean2 = clean2.lstrip('\x00\x01\x02\x03\x04\x05')
+    text_lower = clean2.lower().strip(' .,;:!?\'"()')
+
+    # For multi-word phrases, check each individual word
+    is_single_word = len(text_lower.split()) == 1
+
+    vowel_patterns = ('oo', 'ee', 'ai', 'ea', 'ou', 'ie', 'oa', 'ay', 'ey',
+                      'oi', 'ow', 'igh', 'ough')
+    suffixes = ('ed', 'ing', 'er', 'ly', 'tion', 'sion', 'ness',
+                'ment', 'able', 'ful', 'ous', 'ize', 'ity')
+    common_short = {'is', 'it', 'at', 'on', 'in', 'an', 'as', 'by', 'be',
+                    'we', 'he', 'me', 'my', 'so', 'if', 'or', 'no', 'go',
+                    'do', 'us', 'i', 'a', 'the', 'and', 'for', 'you',
+                    'are', 'was', 'his', 'her', 'has', 'had', 'not',
+                    'but', 'can', 'all', 'one', 'two', 'said', 'who',
+                    'now', 'new', 'old', 'top', 'big', 'six', 'too',
+                    'put', 'end', 'get', 'use', 'man', 'way', 'how',
+                    'why', 'let', 'set', 'yes', 'she', 'them', 'him',
+                    'our', 'their', 'than', 'then', 'made', 'make',
+                    'were', 'will', 'with', 'this', 'that', 'from',
+                    'into', 'over', 'when', 'what', 'where', 'each',
+                    'just', 'like', 'some', 'time', 'come', 'came',
+                    'gave', 'give', 'took', 'take', 'tell', 'told',
+                    'know', 'knew', 'left', 'land', 'name', 'last',
+                    'find', 'found', 'four', 'five', 'send', 'sent',
+                    'next', 'much', 'more', 'most', 'good', 'long',
+                    'years', 'year', 'days', 'day', 'son', 'sons',
+                    'wife', 'wives', 'house', 'land'}
+
+    if is_single_word and 2 <= len(text_lower) <= 25:
+        if any(vp in text_lower for vp in vowel_patterns):
+            return True
+        for suf in suffixes:
+            if text_lower.endswith(suf) and len(text_lower) > len(suf) + 1:
+                return True
+        if text_lower in common_short:
+            return True
+    elif not is_single_word:
+        # Multi-word: count words that match English patterns
+        words = text_lower.split()
+        matches = 0
+        for w in words:
+            wclean = w.strip('.,;:!?\'"()')
+            if not wclean: continue
+            if wclean in common_short:
+                matches += 1
+                continue
+            if 3 <= len(wclean) <= 25:
+                if any(vp in wclean for vp in vowel_patterns):
+                    matches += 1
+                    continue
+                if any(wclean.endswith(s) and len(wclean) > len(s) + 1
+                       for s in suffixes):
+                    matches += 1
+                    continue
+        # If majority of words look English, it's English
+        if matches >= max(2, len(words) * 0.5):
+            return True
+
+    # English proper noun (transliterated names): ASCII-only with first letter
+    # uppercase and 2+ lowercase letters following.  Davka Hebrew encoding 
+    # rarely produces this pattern (it uses uppercase only for letters with dagesh,
+    # which are followed by nikud bytes, not lowercase letters).
+    if (3 <= len(text) <= 30 and text[0].isupper() and text[0].isalpha()):
+        lower_count = sum(1 for c in text if c.islower())
+        if lower_count >= 2:
+            return True
 
     return False
 
@@ -549,6 +861,122 @@ def has_page_break(ev):
             and ev['bytes'][0] == 0x0c)
 
 def is_heb(sty): return sty in HEB_STYLES
+
+
+_HEB_SECTION_HEADING_RE = re.compile(
+    r'\([א-ת"\s\-]+\)|\)[א-ת"\s\-]+\('  # parenthesized pasuk ref like "(א-ט)"
+)
+
+
+def looks_like_section_heading(text):
+    """Detect if standalone text is a Hebrew section/chapter heading.
+
+    A heading is plain Hebrew (no nikud) with a parenthesized verse
+    reference, or contains 'פרק'/'פרשת'.  Typical examples:
+      - "הליכת אברם לארץ כנען )א-ט("
+      - "פרק יב"
+      - "פרשת לכ לכ פרק י\"ב"
+    """
+    if not isinstance(text, str):
+        return False
+    text = text.strip()
+    if len(text) < 5 or len(text) > 100:
+        return False
+    # No nikud or trup → it's not pesukim body text
+    if any(0x0591 <= ord(c) <= 0x05c7 for c in text):
+        return False
+    # Has Hebrew letters
+    if not any(0x05d0 <= ord(c) <= 0x05ea for c in text):
+        return False
+    # Pattern 1: parenthesized pasuk reference
+    if _HEB_SECTION_HEADING_RE.search(text):
+        return True
+    # Pattern 2: explicit chapter or parsha keyword
+    if 'פרק ' in text or 'פרשת ' in text:
+        return True
+    return False
+
+
+def looks_like_section_heading_block(blk):
+    """Detect if a TextBlock is predominantly a Hebrew section heading.
+
+    A heading-block is short (< 60 chars), has 1-2 runs, no nikud,
+    and is at least 80% Hebrew letters with a chapter-like reference.
+    """
+    if not hasattr(blk, 'runs') or not blk.runs:
+        return False
+    if len(blk.runs) > 2:
+        return False
+    full_text = ''.join(t for _, t in blk.runs)
+    if len(full_text) < 5 or len(full_text) > 60:
+        return False
+    # No nikud/trup
+    if any(0x0591 <= ord(c) <= 0x05c7 for c in full_text):
+        return False
+    # Predominantly Hebrew
+    heb_letters = sum(1 for c in full_text if 0x05d0 <= ord(c) <= 0x05ea)
+    eng_letters = sum(1 for c in full_text if c.isalpha() and c.isascii())
+    total = heb_letters + eng_letters
+    if total == 0 or heb_letters < total * 0.8:
+        return False
+    # Has parenthesized pasuk reference or chapter keyword
+    if _HEB_SECTION_HEADING_RE.search(full_text):
+        return True
+    if 'פרק ' in full_text or 'פרשת ' in full_text:
+        return True
+    return False
+
+
+_CHAPTER_START_RE = re.compile(r'^פרק\s+[אבגדהוזחטיכלמנסעפצקרשת]')
+
+
+def is_chapter_start_block(blk):
+    """Detect if a body block starts with 'פרק <letter>' (chapter beginning).
+
+    Used to insert page breaks before each Bible chapter section.
+    """
+    if not hasattr(blk, 'runs') or not blk.runs:
+        return False
+    first_text = blk.runs[0][1].strip()
+    return bool(_CHAPTER_START_RE.match(first_text))
+
+
+def is_subtitle_pair_block(blk):
+    """Detect if block is an English summary + Hebrew chapter heading pair.
+
+    Pattern: 2 runs, one English-only and one Hebrew-only (no nikud), where
+    the Hebrew run looks like a section heading.  These should render as
+    a centered subtitle pair (English line, then Hebrew line below).
+    """
+    if not hasattr(blk, 'runs') or not blk.runs:
+        return False
+    if len(blk.runs) != 2:
+        return False
+    txt_a = blk.runs[0][1]
+    txt_b = blk.runs[1][1]
+    # No nikud anywhere
+    if any(0x0591 <= ord(c) <= 0x05c7 for c in txt_a + txt_b):
+        return False
+    a_heb = any(0x0590 <= ord(c) <= 0x05ff for c in txt_a)
+    b_heb = any(0x0590 <= ord(c) <= 0x05ff for c in txt_b)
+    a_eng = any(c.isalpha() and c.isascii() for c in txt_a)
+    b_eng = any(c.isalpha() and c.isascii() for c in txt_b)
+    # One must be English-only and one Hebrew-only
+    if not ((a_eng and not a_heb and b_heb and not b_eng)
+            or (a_heb and not a_eng and b_eng and not b_heb)):
+        return False
+    # Reasonable total length
+    full = txt_a + txt_b
+    if len(full) > 120 or len(full) < 10:
+        return False
+    # Hebrew portion has a heading-like reference
+    heb_text = txt_a if a_heb else txt_b
+    if _HEB_SECTION_HEADING_RE.search(heb_text):
+        return True
+    if 'פרק ' in heb_text or 'פרשת ' in heb_text:
+        return True
+    return False
+
 
 
 # ── Document model ────────────────────────────────────────────────────────────
@@ -1167,7 +1595,11 @@ def build_model(events, with_nikud=True, with_trup=True):
 
         if sty == HEB_HEADING_STY:
             flush_text(); flush_kw()
-            if heading_count > 0:
+            # Only auto-insert page break for Format A (use_style format), where
+            # HEB_HEADING_STY genuinely marks chapter starts.  In other formats
+            # the same style byte is used for short song fragments which
+            # shouldn't trigger page breaks.
+            if heading_count > 0 and ev.get('use_style', False):
                 blocks.append(TextBlock('page_break'))
             heading_count += 1
             tb = TextBlock('heading'); tb.add(sty, text)
@@ -1252,52 +1684,41 @@ def _inline_heb(para, text, sz=12, bold=False):
     return r
 
 
-# ── KEY WORDS table ───────────────────────────────────────────────────────────
+# ── KEY WORDS list (inline format) ────────────────────────────────────────────
 def _add_kw_table(doc, pairs):
-    NAVY = RGBColor(0x1F, 0x4E, 0x79)
-    tbl = doc.add_table(rows=0, cols=2)
-    tbl.style = 'Table Grid'
-    tbl_xml = tbl._tbl
-    tblPr = tbl_xml.find(qn('w:tblPr'))
-    if tblPr is None:
-        tblPr = OxmlElement('w:tblPr'); tbl_xml.insert(0, tblPr)
-    tblW = OxmlElement('w:tblW')
-    tblW.set(qn('w:w'), '9360'); tblW.set(qn('w:type'), 'dxa')
-    tblPr.append(tblW)
-    tblLayout = OxmlElement('w:tblLayout')
-    tblLayout.set(qn('w:type'), 'fixed')
-    tblPr.append(tblLayout)
+    """Render Key Words in original PDF inline format:
+       הַסַּפָּר )א( - the barber
+    Each entry is one paragraph with Hebrew letter in parens, then dash, then English.
+    """
+    _HEB_LETTERS_KW = ['א', 'ב', 'ג', 'ד', 'ה', 'ו', 'ז', 'ח', 'ט', 'י',
+                       'יא', 'יב', 'יג', 'יד', 'טו', 'טז', 'יז', 'יח', 'יט', 'כ']
 
-    def _mk_border(side):
-        b = OxmlElement(f'w:{side}')
-        b.set(qn('w:val'), 'single'); b.set(qn('w:sz'), '4')
-        b.set(qn('w:space'), '0');    b.set(qn('w:color'), 'B8C4D4')
-        return b
+    for idx, (heb, eng) in enumerate(pairs):
+        p = doc.add_paragraph()
+        _bidi(p, False)
+        _spacing(p, before=30, after=20)
+        p.paragraph_format.left_indent = Inches(0.5)
+        p.paragraph_format.first_line_indent = Inches(-0.3)
 
-    tblBorders = OxmlElement('w:tblBorders')
-    for s in ('top','left','bottom','right','insideH','insideV'):
-        tblBorders.append(_mk_border(s))
-    tblPr.append(tblBorders)
+        letter = _HEB_LETTERS_KW[idx] if idx < len(_HEB_LETTERS_KW) else str(idx + 1)
 
-    for heb, eng in pairs:
-        row = tbl.add_row()
-        row.cells[0].width = Inches(2.0)
-        row.cells[1].width = Inches(4.5)
-        c0 = row.cells[0]; c0.width = Inches(2.0)
-        p0 = c0.paragraphs[0]
-        _bidi(p0, True); _spacing(p0, before=30, after=30)
-        p0.paragraph_format.left_indent  = Inches(0.06)
-        p0.paragraph_format.right_indent = Inches(0.06)
-        tc0Pr = c0._tc.get_or_add_tcPr()
-        shd = OxmlElement('w:shd')
-        shd.set(qn('w:val'),'clear'); shd.set(qn('w:color'),'auto')
-        shd.set(qn('w:fill'),'EEF3FA'); tc0Pr.append(shd)
-        _rtl_run(p0, heb, font='David', sz=12, bold=True, color=NAVY)
-        c1 = row.cells[1]; c1.width = Inches(4.5)
-        p1 = c1.paragraphs[0]
-        _bidi(p1, False); _spacing(p1, before=30, after=30)
-        p1.paragraph_format.left_indent = Inches(0.08)
-        _ltr_run(p1, eng, sz=11)
+        # Hebrew word (RTL embedded)
+        if heb.strip():
+            heb_run = _rtl_run(p, heb.strip(), font='David', sz=13, bold=True)
+        # Hebrew letter in parens like ")א("  (Note: parens around Hebrew letter
+        # appear reversed visually in BiDi rendering)
+        paren_run = p.add_run(f' )‏{letter}‏( ')
+        paren_run.font.name = 'David'
+        paren_run.font.size = Pt(12)
+        # Dash and English translation
+        eng_text = eng.strip().lstrip('-').strip()
+        if eng_text:
+            dash_run = p.add_run('- ')
+            dash_run.font.name = 'Times New Roman'
+            dash_run.font.size = Pt(12)
+            eng_run = p.add_run(eng_text)
+            eng_run.font.name = 'Times New Roman'
+            eng_run.font.size = Pt(12)
 
     doc.add_paragraph()
 
@@ -1462,7 +1883,12 @@ def _render_parsha_topics(doc, blk, style_table):
         p2 = cells[2].paragraphs[0]
         _bidi(p2, False); _spacing(p2, before=40, after=40)
         for sty, txt in row_data.get('desc', []):
-            props = style_table.get(sty, {})
+            props = dict(style_table.get(sty, {}))
+            # Cap size for description column - tables need smaller text
+            if props.get('size_pt', 0) > 11:
+                props['size_pt'] = 11
+            # Don't bold descriptions - they're body text
+            props['bold'] = False
             run_is_heb = props.get('is_hebrew', _is_hebrew_content(txt.encode('utf-8', 'ignore')))
             _styled_run(p2, txt, props, run_is_heb)
 
@@ -1489,12 +1915,41 @@ def _render_qa(doc, blk, style_table):
     NAVY = RGBColor(0x1F, 0x4E, 0x79)
     GRAY = RGBColor(0x50, 0x50, 0x50)
 
+    def _classify(sty, txt):
+        """Return True if run is Hebrew, applying content-trumps-style override."""
+        text_bytes = txt.encode('utf-8', 'ignore')
+        if any(0x0590 <= ord(c) <= 0x05ff for c in txt):
+            return True
+        if _is_clean_english(text_bytes):
+            return False
+        props = style_table.get(sty, {})
+        return props.get('is_hebrew', False) or _is_hebrew_content(text_bytes)
+
+    def _render_runs(p, runs, force_bold=False):
+        """Render a sequence of (sty, text) runs into paragraph p,
+        adding auto-space at Hebrew↔English boundaries."""
+        prev_was_heb = None
+        prev_ended_space = True
+        for sty, txt in runs:
+            run_is_heb = _classify(sty, txt)
+            # Insert space at language boundary
+            if (prev_was_heb is not None
+                and prev_was_heb != run_is_heb
+                and not prev_ended_space
+                and txt and not txt[0].isspace()):
+                p.add_run(' ')
+            props = dict(style_table.get(sty, {}))
+            if force_bold:
+                props['bold'] = True
+            _styled_run(p, txt, props, run_is_heb)
+            prev_was_heb = run_is_heb
+            prev_ended_space = bool(txt and txt[-1].isspace())
+
     # Inyan section header (e.g. "שאלות ותשובות פרשת לכ לכ")
     if blk.inyan_title:
         p = doc.add_paragraph()
         _spacing(p, before=180, after=60)
         _box_border(p)
-        # Split into Hebrew and English parts
         parts = blk.inyan_title.split()
         for word in parts:
             is_h = _is_hebrew_content(word.encode('utf-8', 'ignore'))
@@ -1510,10 +1965,7 @@ def _render_qa(doc, blk, style_table):
             p = doc.add_paragraph()
             _bidi(p, False); _spacing(p, before=60, after=15)
             _ltr_run(p, f'.{n}  ', sz=11)
-            for sty, txt in item['q']:
-                props = style_table.get(sty, {})
-                run_is_heb = props.get('is_hebrew', _is_hebrew_content(txt.encode('utf-8', 'ignore')))
-                _styled_run(p, txt, props, run_is_heb)
+            _render_runs(p, item['q'], force_bold=False)
 
         # Answer paragraph (bold, indented)
         if item['a']:
@@ -1523,17 +1975,14 @@ def _render_qa(doc, blk, style_table):
 
             heb_count = sum(1 for sty, txt in item['a']
                            if _is_hebrew_content(txt.encode('utf-8', 'ignore'))
-                           or style_table.get(sty, {}).get('is_hebrew', False))
+                           or style_table.get(sty, {}).get('is_hebrew', False)
+                           or any(0x0590 <= ord(c) <= 0x05ff for c in txt))
             para_is_heb = heb_count > len(item['a']) / 2
             _bidi(p, para_is_heb)
             if para_is_heb:
                 p.alignment = WD_ALIGN_PARAGRAPH.RIGHT
 
-            for sty, txt in item['a']:
-                props = dict(style_table.get(sty, {}))
-                props['bold'] = True  # answers are always bold
-                run_is_heb = props.get('is_hebrew', _is_hebrew_content(txt.encode('utf-8', 'ignore')))
-                _styled_run(p, txt, props, run_is_heb)
+            _render_runs(p, item['a'], force_bold=True)
 
     doc.add_paragraph()
 
@@ -1629,15 +2078,20 @@ def _render_pronoun(doc, blk, style_table):
     doc.add_paragraph()
 
 
-def build_docx(blocks, out_path, style_table=None):
+def build_docx(blocks, out_path, style_table=None, hf_events=None):
     """Render document blocks to a Word .docx file.
 
     style_table: dict from parse_style_table(), maps style_index → props.
                  When provided, each run gets the correct font, size, bold,
                  italic, and underline from the original DavkaWriter document.
+    hf_events:   dict {'header': [events], 'footer': [events]} from
+                 extract_header_footer_events().  When provided, header/footer
+                 content is placed in Word's headers and footers.
     """
     if style_table is None:
         style_table = {}
+    if hf_events is None:
+        hf_events = {}
 
     def _props(sty):
         """Return style props for a style code, with sensible defaults."""
@@ -1702,7 +2156,52 @@ def build_docx(blocks, out_path, style_table=None):
     doc.styles['Normal'].font.name = 'Calibri'
     doc.styles['Normal'].font.size = Pt(11)
 
+    # ── Populate Word header/footer from extracted DWD events ─────────────
+    def _render_hf_events(target_paragraph, events):
+        """Render header or footer events into the given Word paragraph."""
+        target_paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        for ev in events:
+            if ev['type'] != 'run':
+                continue
+            try:
+                text = decode_run(ev, with_nikud=True, with_trup=True)
+            except Exception:
+                continue
+            if not text.strip():
+                continue
+            if _is_marker_run(text):
+                continue
+            sty = ev['style']
+            props = style_table.get(sty, {})
+            text_bytes = text.encode('utf-8', 'ignore')
+            has_heb_script = any(0x0590 <= ord(c) <= 0x05ff for c in text)
+            if has_heb_script:
+                run_is_heb = True
+            elif _is_clean_english(text_bytes):
+                run_is_heb = False
+            else:
+                run_is_heb = props.get('is_hebrew', False) or _is_hebrew_content(text_bytes)
+            _styled_run(target_paragraph, text + ' ', props, run_is_heb)
+
+    if hf_events.get('header'):
+        hdr = sec.header
+        # Clear existing paragraph
+        hdr_p = hdr.paragraphs[0]
+        hdr_p.clear()
+        _render_hf_events(hdr_p, hf_events['header'])
+
+    if hf_events.get('footer'):
+        ftr = sec.footer
+        ftr_p = ftr.paragraphs[0]
+        ftr_p.clear()
+        _render_hf_events(ftr_p, hf_events['footer'])
+
     in_ysk_body = False
+    ysk_item_count = 0  # Hebrew letter numbering for YOU SHOULD KNOW body items
+
+    # Hebrew alphabet letters for traditional numbering
+    _HEB_LETTERS = ['א', 'ב', 'ג', 'ד', 'ה', 'ו', 'ז', 'ח', 'ט', 'י',
+                    'יא', 'יב', 'יג', 'יד', 'טו', 'טז', 'יז', 'יח', 'יט', 'כ']
 
     for blk_idx, blk in enumerate(blocks):
         if isinstance(blk, TextBlock):
@@ -1717,21 +2216,36 @@ def build_docx(blocks, out_path, style_table=None):
 
             elif role == 'blank':
                 p = doc.add_paragraph(); _spacing(p, before=40, after=40)
-                in_ysk_body = False
+                # Note: do NOT reset in_ysk_body — blank paragraphs naturally
+                # appear between the section header and items, and between items.
 
             elif role == 'section_hdr':
                 txt = blk.text.strip()
                 p = doc.add_paragraph()
                 _bidi(p, False); p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-                _spacing(p, before=180, after=80); _box_border(p)
-                _ltr_run(p, txt, font='Calibri', sz=12, bold=True, color=NAVY)
-                in_ysk_body = (txt == 'YOU SHOULD KNOW')
+                _spacing(p, before=240, after=120)
+                # Match original PDF: plain centered bold underlined text, no decorative box
+                run = p.add_run(txt)
+                run.font.name = 'Times New Roman'
+                run.font.size = Pt(13)
+                run.font.bold = True
+                run.font.underline = True
+                if txt == 'YOU SHOULD KNOW':
+                    in_ysk_body = True
+                    ysk_item_count = 0
+                else:
+                    in_ysk_body = False
 
             elif role == 'heading':
                 p = doc.add_paragraph()
                 _bidi(p, True); p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-                _spacing(p, before=200, after=80); _border_bottom(p)
-                _rtl_run(p, blk.text.strip(), font='David', sz=18, bold=True, color=NAVY)
+                _spacing(p, before=240, after=120)
+                # Match original PDF: bold underlined Hebrew (no color, no border)
+                run = p.add_run(blk.text.strip())
+                run.font.name = 'David'
+                run.font.size = Pt(15)
+                run.font.bold = True
+                run.font.underline = True
                 in_ysk_body = False
 
             elif role == 'mishna':
@@ -1743,10 +2257,30 @@ def build_docx(blocks, out_path, style_table=None):
                 in_ysk_body = False
 
             elif role == 'body':
+                # Insert a page break before chapter starts (e.g., "פרק יב")
+                # for proper visual separation between Bible chapters.
+                if is_chapter_start_block(blk):
+                    pb_p = doc.add_paragraph()
+                    pb_run = pb_p.add_run()
+                    pb_br = OxmlElement('w:br')
+                    pb_br.set(qn('w:type'), 'page')
+                    pb_run._r.append(pb_br)
+
                 p = doc.add_paragraph()
 
                 # Check if this body block is likely a centered title
                 is_title = _looks_like_title(blk_idx)
+
+                # Check if this is a Hebrew section/chapter heading.
+                # Block-level check ensures we only catch single short Hebrew headings,
+                # not mixed-content paragraphs that happen to contain a heading reference.
+                is_section_heading = looks_like_section_heading_block(blk)
+
+                # Check if this is a "subtitle pair": short English summary + Hebrew
+                # chapter heading.  We render these as TWO centered paragraphs
+                # for proper visual hierarchy.
+                is_subtitle_pair = (not is_section_heading
+                                    and is_subtitle_pair_block(blk))
 
                 # Determine paragraph directionality from majority of runs
                 heb_runs = sum(
@@ -1756,31 +2290,146 @@ def build_docx(blocks, out_path, style_table=None):
                 )
                 para_is_heb = heb_runs > len(blk.runs) / 2
 
-                _bidi(p, para_is_heb)
+                # Detect YOU SHOULD KNOW item early so we can override paragraph
+                # direction and alignment before any runs are added.
+                full_text_pre = ''.join(t for _, t in blk.runs).strip()
+                is_ysk_item = (in_ysk_body and not is_title
+                              and not is_section_heading
+                              and not is_subtitle_pair
+                              and len(full_text_pre) >= 8
+                              and ysk_item_count < len(_HEB_LETTERS))
+
+                # For YSK items, override direction to LTR (English numbered list
+                # layout). For all other body content, use language-based direction.
+                if is_ysk_item:
+                    _bidi(p, False)
+                    p.alignment = WD_ALIGN_PARAGRAPH.LEFT
+                else:
+                    _bidi(p, para_is_heb)
+
+                if is_section_heading:
+                    # Section heading: centered, bold, larger spacing, navy color
+                    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                    _spacing(p, before=240, after=80)
+                    NAVY_HEADING = RGBColor(0x1F, 0x4E, 0x79)
+                    for sty, text in blk.runs:
+                        text_bytes = text.encode('utf-8', 'ignore')
+                        has_heb_script = any(0x0590 <= ord(c) <= 0x05ff for c in text)
+                        if has_heb_script:
+                            _rtl_run(p, text, font='David', sz=14, bold=True, color=NAVY_HEADING)
+                        elif _is_clean_english(text_bytes):
+                            _ltr_run(p, text, sz=12, bold=True, color=NAVY_HEADING)
+                        else:
+                            props = _props(sty)
+                            run_is_heb = props.get('is_hebrew', False) or _is_hebrew_content(text_bytes)
+                            _styled_run(p, text, props, run_is_heb)
+                    continue
+
+                if is_subtitle_pair:
+                    # Subtitle pair: render English on top, Hebrew below, both centered
+                    NAVY_SUB = RGBColor(0x1F, 0x4E, 0x79)
+                    # Identify which run is English vs Hebrew
+                    runs_eng = []
+                    runs_heb = []
+                    for sty, txt in blk.runs:
+                        if any(0x0590 <= ord(c) <= 0x05ff for c in txt):
+                            runs_heb.append((sty, txt))
+                        else:
+                            runs_eng.append((sty, txt))
+                    # Remove this paragraph (we're going to add 2 new ones)
+                    p._element.getparent().remove(p._element)
+                    # Render English subtitle first
+                    if runs_eng:
+                        p_en = doc.add_paragraph()
+                        p_en.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                        _spacing(p_en, before=180, after=10)
+                        _bidi(p_en, False)
+                        for sty, txt in runs_eng:
+                            _ltr_run(p_en, txt, sz=12, bold=True, color=NAVY_SUB)
+                    # Render Hebrew heading below
+                    if runs_heb:
+                        p_he = doc.add_paragraph()
+                        p_he.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                        _spacing(p_he, before=10, after=80)
+                        _bidi(p_he, True)
+                        for sty, txt in runs_heb:
+                            _rtl_run(p_he, txt, font='David', sz=14, bold=True, color=NAVY_SUB)
+                    continue
 
                 if is_title:
                     p.alignment = WD_ALIGN_PARAGRAPH.CENTER
                     _spacing(p, before=120, after=60)
+                elif is_ysk_item:
+                    # Already set LTR + alignment above; just spacing/indent
+                    p.paragraph_format.left_indent = Inches(0.4)
+                    p.paragraph_format.first_line_indent = Inches(-0.4)
+                    _spacing(p, before=20, after=40)
                 elif para_is_heb:
                     p.alignment = WD_ALIGN_PARAGRAPH.RIGHT
                     _spacing(p, before=30, after=50)
                 else:
                     _spacing(p, before=30, after=50)
 
-                # Detect mixed-language short blocks (fill-in-the-blank pairs)
-                # and insert a tab separator between Hebrew and English sections
+                # YOU SHOULD KNOW items: prepend Hebrew letter numbering
+                # ("א.", "ב.", "ג.", etc.) before any other run content.
+                # Add a Unicode Left-to-Right Mark (U+200E) before the number to
+                # ensure paragraph direction is LTR even when content starts with Hebrew.
+                if is_ysk_item:
+                    heb_letter = _HEB_LETTERS[ysk_item_count]
+                    # U+200E is the LTR mark; prefix with it to force LTR layout
+                    num_run = p.add_run(f'\u200e{heb_letter}.\u200e ')
+                    num_run.font.name = 'Times New Roman'
+                    num_run.font.size = Pt(13)
+                    num_run.font.bold = True
+                    # Force the number run to be LTR direction
+                    rPr = num_run._r.get_or_add_rPr()
+                    rtl_el = OxmlElement('w:rtl')
+                    rtl_el.set(qn('w:val'), '0')
+                    rPr.append(rtl_el)
+                    ysk_item_count += 1
+
+                    # Strip leading control chars (\r, \n, \t) from the first
+                    # text run to keep the number adjacent to the content.
+                    if blk.runs:
+                        first_sty, first_text = blk.runs[0]
+                        cleaned = first_text.lstrip('\r\n\t\x0b\x0c')
+                        if cleaned != first_text:
+                            blk.runs[0] = (first_sty, cleaned)
+
+                # Detect fill-in-the-blank worksheet entries: Hebrew form
+                # immediately followed by an English label, no separator,
+                # very short (< 25 chars), 2-3 runs.  These appear in pronoun
+                # worksheets where Hebrew form and English label are typeset
+                # side-by-side in the original.
                 full_text = ''.join(t for _, t in blk.runs)
-                is_mixed_short = (
-                    len(full_text) < 40
-                    and len(blk.runs) >= 2
-                    and any(_is_hebrew_content(t.encode('utf-8','ignore'))
-                            for _, t in blk.runs)
-                    and any(all(c < 0x80 for c in t.encode('utf-8','ignore'))
-                            and any(c.isalpha() for c in t)
-                            for _, t in blk.runs)
-                )
+                runs_list = blk.runs
+                # Specific pattern: Hebrew run ending without space followed by
+                # English run starting without space, all very short
+                is_mixed_short = False
+                if (len(full_text) < 25 and 2 <= len(runs_list) <= 3):
+                    has_heb = any(_is_hebrew_content(t.encode('utf-8','ignore'))
+                                   for _, t in runs_list)
+                    has_eng = any(all(c < 0x80 for c in t.encode('utf-8','ignore'))
+                                   and any(c.isalpha() for c in t)
+                                   for _, t in runs_list)
+                    if has_heb and has_eng:
+                        # Must have a Hebrew→English transition WITHOUT space at boundary
+                        for j in range(len(runs_list) - 1):
+                            prev_text = runs_list[j][1]
+                            next_text = runs_list[j+1][1]
+                            if (prev_text and next_text
+                                and not prev_text.endswith(' ')
+                                and not next_text.startswith(' ')):
+                                # Check transition is heb→eng
+                                prev_heb = any(0x0590 <= ord(c) <= 0x05ff for c in prev_text)
+                                next_eng = (all(c < 0x80 for c in next_text.encode('utf-8','ignore'))
+                                            and any(c.isalpha() for c in next_text))
+                                if prev_heb and next_eng:
+                                    is_mixed_short = True
+                                    break
 
                 prev_was_heb = None
+                prev_text_ended_with_space = True  # nothing before, treat as space
                 for sty, text in blk.runs:
                     props = _props(sty)
                     # Content trumps style metadata: if text is clearly English
@@ -1799,16 +2448,26 @@ def build_docx(blocks, out_path, style_table=None):
                             or props.get('is_hebrew', False)
                             or _is_hebrew_content(text_bytes)
                         )
+
                     # Insert separator when switching from Hebrew to English in
-                    # short mixed blocks (fill-in-the-blank worksheet entries)
+                    # short fill-in-the-blank worksheet entries
                     if (is_mixed_short
                         and prev_was_heb is True and run_is_heb is False):
                         sep_run = p.add_run('  →  ')
                         sep_run.font.name = 'Calibri'
                         sep_run.font.size = Pt(9)
                         sep_run.font.color.rgb = GRAY
+                    # Otherwise just add a space when transitioning between
+                    # languages without one already, so words don't run together
+                    elif (prev_was_heb is not None
+                          and prev_was_heb != run_is_heb
+                          and not prev_text_ended_with_space
+                          and text and not text[0].isspace()):
+                        space_run = p.add_run(' ')
+
                     _styled_run(p, text, props, run_is_heb)
                     prev_was_heb = run_is_heb
+                    prev_text_ended_with_space = bool(text and text[-1].isspace())
 
         elif isinstance(blk, ImageBlock):
             # Embed image inline; scale to fit 6-inch page width
@@ -1837,14 +2496,32 @@ def build_docx(blocks, out_path, style_table=None):
             in_ysk_body = False
 
         elif isinstance(blk, ParshaTopicsBlock):
+            # Page break before Parsha Topics (major section)
+            pb_p = doc.add_paragraph()
+            pb_run = pb_p.add_run()
+            pb_br = OxmlElement('w:br')
+            pb_br.set(qn('w:type'), 'page')
+            pb_run._r.append(pb_br)
             _render_parsha_topics(doc, blk, style_table)
             in_ysk_body = False
 
         elif isinstance(blk, QABlock):
+            # Page break before Q&A section
+            pb_p = doc.add_paragraph()
+            pb_run = pb_p.add_run()
+            pb_br = OxmlElement('w:br')
+            pb_br.set(qn('w:type'), 'page')
+            pb_run._r.append(pb_br)
             _render_qa(doc, blk, style_table)
             in_ysk_body = False
 
         elif isinstance(blk, PronounBlock):
+            # Page break before Pronoun chart
+            pb_p = doc.add_paragraph()
+            pb_run = pb_p.add_run()
+            pb_br = OxmlElement('w:br')
+            pb_br.set(qn('w:type'), 'page')
+            pb_run._r.append(pb_br)
             _render_pronoun(doc, blk, style_table)
             in_ysk_body = False
 
@@ -1916,7 +2593,17 @@ def convert(inp, out=None, with_nikud=True, with_trup=True):
 
     print('Building DOCX …')
     style_table = parse_style_table(data)
-    build_docx(blocks, str(docx_path), style_table)
+
+    # Normalize style sizes based on usage frequency: heavily-used styles are
+    # body text and need to be capped at body sizes (DavkaWriter sometimes
+    # stores 76pt for body pesukim which is too large for Word page layout).
+    style_table = _normalize_style_sizes(style_table, evts)
+
+    # Extract header/footer events using the run/para signatures for this format
+    run_sig, para_sig, _, _ = _detect_format(data)
+    hf_events = extract_header_footer_events(data, run_sig, para_sig) if run_sig else {}
+
+    build_docx(blocks, str(docx_path), style_table, hf_events)
 
     if img_blocks:
         print(f'Packaging ZIP with {len(img_blocks)} image(s) …')
